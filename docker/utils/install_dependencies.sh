@@ -93,7 +93,9 @@ mysql80)
     if [ -z "$VERSION" ]; then
         VERSION=8.0.30
     fi
-    apt install -y --no-install-recommends -f mysql-client-8.0 mysql-server-8.0 mysql-client-8.0 libmysqlclient21
+    apt install -y --no-install-recommends -f /tmp/mysql-apt-config_0.8.12-1_all.debmysql-client-8.0 libmysqlclient21
+    do_fetch https://dev.mysql.com/get/mysql-apt-config_0.8.12-1_all.deb /tmp/mysql-apt-config_0.8.12-1_all.deb
+    echo "4" | apt-get install -y /tmp/mysql-apt-config_0.8.12-1_all.deb
     ;;
 percona)
     PACKAGES=(

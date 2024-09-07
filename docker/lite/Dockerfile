@@ -31,7 +31,7 @@ COPY --chown=vitess:vitess . /vt/src/vitess.io/vitess
 RUN make install PREFIX=/vt/install
 
 # Start over and build the final image.
-FROM ubuntu:jammy
+FROM ubuntu:bionic
 
 # Install dependencies
 COPY docker/utils/install_dependencies.sh /vt/dist/install_dependencies.sh
