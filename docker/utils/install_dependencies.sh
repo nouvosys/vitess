@@ -54,7 +54,7 @@ BASE_PACKAGES=(
     libdbd-mysql-perl
     libwww-perl
     libev4
-    libjemalloc2
+#    libjemalloc2
     libtcmalloc-minimal4
     procps
     rsync
@@ -96,7 +96,7 @@ mysql80)
     apt-get update
     apt install -y --no-install-recommends -f mysql-client-8.0 libmysqlclient21
     do_fetch https://dev.mysql.com/get/mysql-apt-config_0.8.12-1_all.deb /tmp/mysql-apt-config_0.8.12-1_all.deb
-    echo "4" | apt-get install -y /tmp/mysql-apt-config_0.8.12-1_all.deb
+    echo "7" | echo "4" | apt-get install -y  /tmp/mysql-apt-config_0.8.12-1_all.deb
     ;;
 percona)
     PACKAGES=(
