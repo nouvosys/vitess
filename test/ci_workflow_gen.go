@@ -75,6 +75,7 @@ var (
 		"xb_backup",
 		"backup_pitr",
 		"backup_pitr_xtrabackup",
+		"backup_pitr_mysqlshell",
 		"21",
 		"mysql_server_vault",
 		"vstream",
@@ -115,7 +116,8 @@ var (
 		"vreplication_v2",
 		"vreplication_partial_movetables_and_materialize",
 		"vreplication_foreign_key_stress",
-		"vreplication_migrate_vdiff2_convert_tz",
+		"vreplication_migrate",
+		"vreplication_vtctldclient_vdiff2_movetables_tz",
 		"vreplication_multi_tenant",
 		"schemadiff_vrepl",
 		"topo_connection_cache",
@@ -152,7 +154,8 @@ var (
 		"onlineddl_vrepl_stress_suite",
 		"onlineddl_vrepl_suite",
 		"vreplication_basic",
-		"vreplication_migrate_vdiff2_convert_tz",
+		"vreplication_migrate",
+		"vreplication_vtctldclient_vdiff2_movetables_tz",
 	}
 )
 

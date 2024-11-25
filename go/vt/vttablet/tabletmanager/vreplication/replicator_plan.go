@@ -33,7 +33,7 @@ import (
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/evalengine"
-	"vitess.io/vitess/go/vt/vttablet"
+	vttablet "vitess.io/vitess/go/vt/vttablet/common"
 
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 	querypb "vitess.io/vitess/go/vt/proto/query"
@@ -54,13 +54,14 @@ import (
 // of the members, leaving the original plan unchanged.
 // The constructor is buildReplicatorPlan in table_plan_builder.go
 type ReplicatorPlan struct {
-	VStreamFilter *binlogdatapb.Filter
-	TargetTables  map[string]*TablePlan
-	TablePlans    map[string]*TablePlan
-	ColInfoMap    map[string][]*ColumnInfo
-	stats         *binlogplayer.Stats
-	Source        *binlogdatapb.BinlogSource
-	collationEnv  *collations.Environment
+	VStreamFilter  *binlogdatapb.Filter
+	TargetTables   map[string]*TablePlan
+	TablePlans     map[string]*TablePlan
+	ColInfoMap     map[string][]*ColumnInfo
+	stats          *binlogplayer.Stats
+	Source         *binlogdatapb.BinlogSource
+	collationEnv   *collations.Environment
+	workflowConfig *vttablet.VReplicationConfig
 }
 
 // buildExecution plan uses the field info as input and the partially built
@@ -100,27 +101,27 @@ func (rp *ReplicatorPlan) buildExecutionPlan(fieldEvent *binlogdatapb.FieldEvent
 // requires us to wait for the field info sent by the source.
 func (rp *ReplicatorPlan) buildFromFields(tableName string, lastpk *sqltypes.Result, fields []*querypb.Field) (*TablePlan, error) {
 	tpb := &tablePlanBuilder{
-		name:         sqlparser.NewIdentifierCS(tableName),
-		lastpk:       lastpk,
-		colInfos:     rp.ColInfoMap[tableName],
-		stats:        rp.stats,
-		source:       rp.Source,
-		collationEnv: rp.collationEnv,
+		name:           sqlparser.NewIdentifierCS(tableName),
+		lastpk:         lastpk,
+		colInfos:       rp.ColInfoMap[tableName],
+		stats:          rp.stats,
+		source:         rp.Source,
+		collationEnv:   rp.collationEnv,
+		workflowConfig: rp.workflowConfig,
 	}
 	for _, field := range fields {
 		colName := sqlparser.NewIdentifierCI(field.Name)
-		isGenerated := false
+		generated := false
+		// We have to loop over the columns in the plan as the columns between the
+		// source and target are not always 1 to 1.
 		for _, colInfo := range tpb.colInfos {
 			if !strings.EqualFold(colInfo.Name, field.Name) {
 				continue
 			}
 			if colInfo.IsGenerated {
-				isGenerated = true
+				generated = true
 			}
 			break
-		}
-		if isGenerated {
-			continue
 		}
 		cexpr := &colExpr{
 			colName: colName,
@@ -131,6 +132,7 @@ func (rp *ReplicatorPlan) buildFromFields(tableName string, lastpk *sqltypes.Res
 			references: map[string]bool{
 				field.Name: true,
 			},
+			isGenerated: generated,
 		}
 		tpb.colExprs = append(tpb.colExprs, cexpr)
 	}
@@ -220,7 +222,8 @@ type TablePlan struct {
 	// PartialUpdates are same as PartialInserts, but for update statements
 	PartialUpdates map[string]*sqlparser.ParsedQuery
 
-	CollationEnv *collations.Environment
+	CollationEnv   *collations.Environment
+	WorkflowConfig *vttablet.VReplicationConfig
 }
 
 // MarshalJSON performs a custom JSON Marshalling.
@@ -286,7 +289,7 @@ func (tp *TablePlan) applyBulkInsert(sqlbuffer *bytes2.Buffer, rows []*querypb.R
 // now and punt on the others.
 func (tp *TablePlan) isOutsidePKRange(bindvars map[string]*querypb.BindVariable, before, after bool, stmtType string) bool {
 	// added empty comments below, otherwise gofmt removes the spaces between the bitwise & and obfuscates this check!
-	if vttablet.VReplicationExperimentalFlags /**/ & /**/ vttablet.VReplicationExperimentalFlagOptimizeInserts == 0 {
+	if tp.WorkflowConfig.ExperimentalFlags /**/ & /**/ vttablet.VReplicationExperimentalFlagOptimizeInserts == 0 {
 		return false
 	}
 	// Ensure there is one and only one value in lastpk and pkrefs.
@@ -605,12 +608,13 @@ func valsEqual(v1, v2 sqltypes.Value) bool {
 	return v1.ToString() == v2.ToString()
 }
 
-// AppendFromRow behaves like Append but takes a querypb.Row directly, assuming that
-// the fields in the row are in the same order as the placeholders in this query. The fields might include generated
-// columns which are dropped, by checking against skipFields, before binding the variables
-// note: there can be more fields than bind locations since extra columns might be requested from the source if not all
-// primary keys columns are present in the target table, for example. Also some values in the row may not correspond for
-// values from the database on the source: sum/count for aggregation queries, for example
+// AppendFromRow behaves like Append but takes a querypb.Row directly, assuming that the
+// fields in the row are in the same order as the placeholders in this query. The fields
+// might include generated columns which are dropped before binding the variables note:
+// there can be more fields than bind locations since extra columns might be requested
+// from the source if not all primary keys columns are present in the target table, for
+// example. Also some values in the row may not correspond for values from the database
+// on the source: sum/count for aggregation queries, for example.
 func (tp *TablePlan) appendFromRow(buf *bytes2.Buffer, row *querypb.Row) error {
 	bindLocations := tp.BulkInsertValues.BindLocations()
 	if len(tp.Fields) < len(bindLocations) {

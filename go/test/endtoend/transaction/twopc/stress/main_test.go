@@ -67,11 +67,14 @@ func TestMain(m *testing.M) {
 		clusterInstance.VtGateExtraArgs = append(clusterInstance.VtGateExtraArgs,
 			"--transaction_mode", "TWOPC",
 			"--grpc_use_effective_callerid",
+			"--tablet_refresh_interval", "2s",
 		)
 		clusterInstance.VtTabletExtraArgs = append(clusterInstance.VtTabletExtraArgs,
 			"--twopc_enable",
 			"--twopc_abandon_age", "1",
 			"--migration_check_interval", "2s",
+			"--onterm_timeout", "1s",
+			"--onclose_timeout", "1s",
 		)
 
 		// Start keyspace
@@ -122,8 +125,6 @@ func start(t *testing.T) (*mysql.Conn, func()) {
 
 func cleanup(t *testing.T) {
 	cluster.PanicHandler(t)
-
-	utils.ClearOutTable(t, vtParams, "twopc_fuzzer_insert")
-	utils.ClearOutTable(t, vtParams, "twopc_fuzzer_update")
 	utils.ClearOutTable(t, vtParams, "twopc_t1")
+	utils.ClearOutTable(t, vtParams, "twopc_settings")
 }

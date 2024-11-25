@@ -31,6 +31,7 @@ import (
 	"vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/topo/topoproto"
 	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver"
 
 	replicationdatapb "vitess.io/vitess/go/vt/proto/replicationdata"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -354,7 +355,7 @@ func (tm *TabletManager) InitPrimary(ctx context.Context, semiSync bool) (string
 
 	// If semi-sync is enabled, we need to set two pc to be allowed.
 	// Otherwise, we block all Prepared calls because atomic transactions require semi-sync for correctness..
-	tm.QueryServiceControl.SetTwoPCAllowed(semiSyncAction == SemiSyncActionSet)
+	tm.QueryServiceControl.SetTwoPCAllowed(tabletserver.TwoPCAllowed_SemiSync, semiSyncAction == SemiSyncActionSet)
 
 	// Setting super_read_only `OFF` so that we can run the DDL commands
 	if _, err := tm.MysqlDaemon.SetSuperReadOnly(ctx, false); err != nil {
@@ -408,6 +409,24 @@ func (tm *TabletManager) PopulateReparentJournal(ctx context.Context, timeCreate
 	cmds := []string{mysqlctl.PopulateReparentJournal(timeCreatedNS, actionName, topoproto.TabletAliasString(primaryAlias), pos)}
 
 	return tm.MysqlDaemon.ExecuteSuperQueryList(ctx, cmds)
+}
+
+// ReadReparentJournalInfo reads the information from reparent journal.
+func (tm *TabletManager) ReadReparentJournalInfo(ctx context.Context) (int, error) {
+	log.Infof("ReadReparentJournalInfo")
+	if err := tm.waitForGrantsToHaveApplied(ctx); err != nil {
+		return 0, err
+	}
+
+	query := mysqlctl.ReadReparentJournalInfoQuery()
+	res, err := tm.MysqlDaemon.FetchSuperQuery(ctx, query)
+	if err != nil {
+		return 0, err
+	}
+	if len(res.Rows) != 1 {
+		return 0, vterrors.Errorf(vtrpc.Code_INTERNAL, "unexpected rows when reading reparent journal, got %v", len(res.Rows))
+	}
+	return res.Rows[0][0].ToInt()
 }
 
 // InitReplica sets replication primary and position, and waits for the
@@ -600,7 +619,7 @@ func (tm *TabletManager) UndoDemotePrimary(ctx context.Context, semiSync bool) e
 
 	// If semi-sync is enabled, we need to set two pc to be allowed.
 	// Otherwise, we block all Prepared calls because atomic transactions require semi-sync for correctness..
-	tm.QueryServiceControl.SetTwoPCAllowed(semiSyncAction == SemiSyncActionSet)
+	tm.QueryServiceControl.SetTwoPCAllowed(tabletserver.TwoPCAllowed_SemiSync, semiSyncAction == SemiSyncActionSet)
 
 	// If using semi-sync, we need to enable source-side.
 	if err := tm.fixSemiSync(ctx, topodatapb.TabletType_PRIMARY, semiSyncAction); err != nil {
@@ -707,6 +726,7 @@ func (tm *TabletManager) setReplicationSourceLocked(ctx context.Context, parentA
 	wasReplicating := false
 	shouldbeReplicating := false
 	status, err := tm.MysqlDaemon.ReplicationStatus(ctx)
+	replicaPosition := status.RelayLogPosition
 	if err == mysql.ErrNotReplica {
 		// This is a special error that means we actually succeeded in reading
 		// the status, but the status is empty because replication is not
@@ -716,6 +736,12 @@ func (tm *TabletManager) setReplicationSourceLocked(ctx context.Context, parentA
 		// Since we continue in the case of this error, make sure 'status' is
 		// in a known, empty state.
 		status = replication.ReplicationStatus{}
+		// The replica position we use for the errant GTID detection should be the executed
+		// GTID set since this tablet is not running replication at all.
+		replicaPosition, err = tm.MysqlDaemon.PrimaryPosition(ctx)
+		if err != nil {
+			return err
+		}
 	} else if err != nil {
 		// Abort on any other non-nil error.
 		return err
@@ -747,11 +773,38 @@ func (tm *TabletManager) setReplicationSourceLocked(ctx context.Context, parentA
 	if err != nil {
 		return err
 	}
+
 	host := parent.Tablet.MysqlHostname
 	port := parent.Tablet.MysqlPort
 	// If host is empty, then we shouldn't even attempt the reparent. That tablet has already shutdown.
 	if host == "" {
 		return vterrors.New(vtrpc.Code_FAILED_PRECONDITION, "Shard primary has empty mysql hostname")
+	}
+	// Errant GTID detection.
+	{
+		// Find the executed GTID set of the tablet that we are reparenting to.
+		// We will then compare our own position against it to verify that we don't
+		// have an errant GTID. If we find any GTID that we have, but the primary doesn't,
+		// we will not enter the replication graph and instead fail replication.
+		primaryStatus, err := tm.tmc.PrimaryStatus(ctx, parent.Tablet)
+		if err != nil {
+			return err
+		}
+		primaryPosition, err := replication.DecodePosition(primaryStatus.Position)
+		if err != nil {
+			return err
+		}
+		primarySid, err := replication.ParseSID(primaryStatus.ServerUuid)
+		if err != nil {
+			return err
+		}
+		errantGtid, err := replication.ErrantGTIDsOnReplica(replicaPosition, primaryPosition, primarySid)
+		if err != nil {
+			return err
+		}
+		if errantGtid != "" {
+			return vterrors.New(vtrpc.Code_FAILED_PRECONDITION, fmt.Sprintf("Errant GTID detected - %s; Primary GTID - %s, Replica GTID - %s", errantGtid, primaryPosition, replicaPosition.String()))
+		}
 	}
 	if status.SourceHost != host || status.SourcePort != port || heartbeatInterval != 0 {
 		// This handles both changing the address and starting replication.
@@ -925,7 +978,7 @@ func (tm *TabletManager) PromoteReplica(ctx context.Context, semiSync bool) (str
 
 	// If semi-sync is enabled, we need to set two pc to be allowed.
 	// Otherwise, we block all Prepared calls because atomic transactions require semi-sync for correctness..
-	tm.QueryServiceControl.SetTwoPCAllowed(semiSyncAction == SemiSyncActionSet)
+	tm.QueryServiceControl.SetTwoPCAllowed(tabletserver.TwoPCAllowed_SemiSync, semiSyncAction == SemiSyncActionSet)
 
 	pos, err := tm.MysqlDaemon.Promote(ctx, tm.hookExtraEnv())
 	if err != nil {

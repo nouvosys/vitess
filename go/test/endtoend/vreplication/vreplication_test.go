@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"runtime"
 	"strconv"
@@ -586,12 +587,16 @@ func testVStreamCellFlag(t *testing.T) {
 	}
 }
 
-// TestCellAliasVreplicationWorkflow tests replication from a cell with an alias to test the tablet picker's alias functionality
-// We also reuse the setup of this test to validate that the "vstream * from" vtgate query functionality is functional
+// TestCellAliasVreplicationWorkflow tests replication from a cell with an alias to test
+// the tablet picker's alias functionality.
+// We also reuse the setup of this test to validate that the "vstream * from" vtgate
+// query functionality is functional.
 func TestCellAliasVreplicationWorkflow(t *testing.T) {
 	cells := []string{"zone1", "zone2"}
-	defer mainClusterConfig.enableGTIDCompression()
-	defer setAllVTTabletExperimentalFlags()
+	resetCompression := mainClusterConfig.enableGTIDCompression()
+	defer resetCompression()
+	resetExperimentalFlags := setAllVTTabletExperimentalFlags()
+	defer resetExperimentalFlags()
 	vc = NewVitessCluster(t, &clusterOptions{cells: cells})
 	defer vc.TearDown()
 
@@ -717,12 +722,12 @@ func shardCustomer(t *testing.T, testReverse bool, cells []*Cell, sourceCellOrAl
 		vtgateConn := getConnection(t, vc.ClusterConfig.hostname, vc.ClusterConfig.vtgateMySQLPort)
 		defer vtgateConn.Close()
 		// Confirm that the 0 scale decimal field, dec80, is replicated correctly
-		dec80Replicated := false
 		execVtgateQuery(t, vtgateConn, sourceKs, "update customer set dec80 = 0")
 		execVtgateQuery(t, vtgateConn, sourceKs, "update customer set blb = \"new blob data\" where cid=3")
 		execVtgateQuery(t, vtgateConn, sourceKs, "update json_tbl set j1 = null, j2 = 'null', j3 = '\"null\"'")
 		execVtgateQuery(t, vtgateConn, sourceKs, "insert into json_tbl(id, j1, j2, j3) values (7, null, 'null', '\"null\"')")
 		waitForNoWorkflowLag(t, vc, targetKs, workflow)
+		dec80Replicated := false
 		for _, tablet := range []*cluster.VttabletProcess{customerTab1, customerTab2} {
 			// Query the tablet's mysqld directly as the targets will have denied table entries.
 			dbc, err := tablet.TabletConn(targetKs, true)
@@ -797,6 +802,11 @@ func shardCustomer(t *testing.T, testReverse bool, cells []*Cell, sourceCellOrAl
 			commit, _ = vc.startQuery(t, openTxQuery)
 		}
 		switchWritesDryRun(t, workflowType, ksWorkflow, dryRunResultsSwitchWritesCustomerShard)
+		shardNames := make([]string, 0, len(vc.Cells[defaultCell.Name].Keyspaces[sourceKs].Shards))
+		for shardName := range maps.Keys(vc.Cells[defaultCell.Name].Keyspaces[sourceKs].Shards) {
+			shardNames = append(shardNames, shardName)
+		}
+		testSwitchTrafficPermissionChecks(t, workflowType, sourceKs, shardNames, targetKs, workflow)
 		switchWrites(t, workflowType, ksWorkflow, false)
 
 		checkThatVDiffFails(t, targetKs, workflow)
@@ -1587,6 +1597,60 @@ func switchWritesDryRun(t *testing.T, workflowType, ksWorkflow string, dryRunRes
 		"SwitchTraffic", "--tablet-types=primary", "--dry-run")
 	require.NoError(t, err, fmt.Sprintf("Switch writes DryRun Error: %s: %s", err, output))
 	validateDryRunResults(t, output, dryRunResults)
+}
+
+// testSwitchTrafficPermissionsChecks confirms that for the SwitchTraffic command, the
+// necessary permissions are checked properly on the source keyspace's primary tablets.
+// This ensures that we can create and manage the reverse vreplication workflow.
+func testSwitchTrafficPermissionChecks(t *testing.T, workflowType, sourceKeyspace string, sourceShards []string, targetKeyspace, workflow string) {
+	applyPrivileges := func(query string) {
+		for _, shard := range sourceShards {
+			primary := vc.getPrimaryTablet(t, sourceKeyspace, shard)
+			_, err := primary.QueryTablet(query, primary.Keyspace, false)
+			require.NoError(t, err)
+		}
+	}
+	runDryRunCmd := func(expectErr bool) {
+		_, err := vc.VtctldClient.ExecuteCommandWithOutput(workflowType, "--workflow", workflow, "--target-keyspace", targetKeyspace,
+			"SwitchTraffic", "--tablet-types=primary", "--dry-run")
+		require.True(t, ((err != nil) == expectErr), "expected error: %t, got: %v", expectErr, err)
+	}
+
+	defer func() {
+		// Put the default global privs back in place.
+		applyPrivileges("grant select,insert,update,delete on *.* to vt_filtered@localhost")
+	}()
+
+	t.Run("test switch traffic permission checks", func(t *testing.T) {
+		t.Run("test without global privileges", func(t *testing.T) {
+			applyPrivileges("revoke select,insert,update,delete on *.* from vt_filtered@localhost")
+			runDryRunCmd(true)
+		})
+
+		t.Run("test with db level privileges", func(t *testing.T) {
+			applyPrivileges(fmt.Sprintf("grant select,insert,update,delete on %s.* to vt_filtered@localhost",
+				sidecarDBIdentifier))
+			runDryRunCmd(false)
+		})
+
+		t.Run("test without global or db level privileges", func(t *testing.T) {
+			applyPrivileges(fmt.Sprintf("revoke select,insert,update,delete on %s.* from vt_filtered@localhost",
+				sidecarDBIdentifier))
+			runDryRunCmd(true)
+		})
+
+		t.Run("test with table level privileges", func(t *testing.T) {
+			applyPrivileges(fmt.Sprintf("grant select,insert,update,delete on %s.vreplication to vt_filtered@localhost",
+				sidecarDBIdentifier))
+			runDryRunCmd(false)
+		})
+
+		t.Run("test without global, db, or table level privileges", func(t *testing.T) {
+			applyPrivileges(fmt.Sprintf("revoke select,insert,update,delete on %s.vreplication from vt_filtered@localhost",
+				sidecarDBIdentifier))
+			runDryRunCmd(true)
+		})
+	})
 }
 
 // restartWorkflow confirms that a workflow can be successfully

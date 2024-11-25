@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"vitess.io/vitess/go/mysql/sqlerror"
 	"vitess.io/vitess/go/vt/concurrency"
@@ -69,6 +70,14 @@ const (
 	Commit2pcConclude
 )
 
+var phaseMessage = map[commitPhase]string{
+	Commit2pcCreateTransaction: "Create Transaction",
+	Commit2pcPrepare:           "Prepare",
+	Commit2pcStartCommit:       "Start Commit",
+	Commit2pcPrepareCommit:     "Prepare Commit",
+	Commit2pcConclude:          "Conclude",
+}
+
 // Begin begins a new transaction. If one is already in progress, it commits it
 // and starts a new one.
 func (txc *TxConn) Begin(ctx context.Context, session *SafeSession, txAccessModes []sqlparser.TxAccessMode) error {
@@ -107,10 +116,24 @@ func (txc *TxConn) Commit(ctx context.Context, session *SafeSession) error {
 		twopc = txc.mode == vtgatepb.TransactionMode_TWOPC
 	}
 
+	defer recordCommitTime(session, twopc, time.Now())
 	if twopc {
 		return txc.commit2PC(ctx, session)
 	}
 	return txc.commitNormal(ctx, session)
+}
+
+func recordCommitTime(session *SafeSession, twopc bool, startTime time.Time) {
+	switch {
+	case len(session.ShardSessions) == 0:
+		// No-op
+	case len(session.ShardSessions) == 1:
+		commitMode.Record("Single", startTime)
+	case twopc:
+		commitMode.Record("TwoPC", startTime)
+	default:
+		commitMode.Record("Multi", startTime)
+	}
 }
 
 func (txc *TxConn) queryService(ctx context.Context, alias *topodatapb.TabletAlias) (queryservice.QueryService, error) {
@@ -187,14 +210,14 @@ func (txc *TxConn) commitNormal(ctx context.Context, session *SafeSession) error
 
 // commit2PC will not used the pinned tablets - to make sure we use the current source, we need to use the gateway's queryservice
 func (txc *TxConn) commit2PC(ctx context.Context, session *SafeSession) (err error) {
-	if len(session.PreSessions) != 0 || len(session.PostSessions) != 0 {
-		_ = txc.Rollback(ctx, session)
-		return vterrors.New(vtrpcpb.Code_FAILED_PRECONDITION, "pre or post actions not allowed for 2PC commits")
-	}
-
 	// If the number of participants is one or less, then it's a normal commit.
 	if len(session.ShardSessions) <= 1 {
 		return txc.commitNormal(ctx, session)
+	}
+
+	if err := txc.checkValidCondition(session); err != nil {
+		_ = txc.Rollback(ctx, session)
+		return err
 	}
 
 	mmShard := session.ShardSessions[0]
@@ -206,11 +229,12 @@ func (txc *TxConn) commit2PC(ctx context.Context, session *SafeSession) (err err
 	}
 
 	var txPhase commitPhase
+	var startCommitState querypb.StartCommitState
 	defer func() {
 		if err == nil {
 			return
 		}
-		txc.errActionAndLogWarn(ctx, session, txPhase, dtid, mmShard, rmShards)
+		txc.errActionAndLogWarn(ctx, session, txPhase, startCommitState, dtid, mmShard, rmShards)
 	}()
 
 	txPhase = Commit2pcCreateTransaction
@@ -244,7 +268,7 @@ func (txc *TxConn) commit2PC(ctx context.Context, session *SafeSession) (err err
 	}
 
 	txPhase = Commit2pcStartCommit
-	err = txc.tabletGateway.StartCommit(ctx, mmShard.Target, mmShard.TransactionId, dtid)
+	startCommitState, err = txc.tabletGateway.StartCommit(ctx, mmShard.Target, mmShard.TransactionId, dtid)
 	if err != nil {
 		return err
 	}
@@ -276,19 +300,45 @@ func (txc *TxConn) commit2PC(ctx context.Context, session *SafeSession) (err err
 	return nil
 }
 
-func (txc *TxConn) errActionAndLogWarn(ctx context.Context, session *SafeSession, txPhase commitPhase, dtid string, mmShard *vtgatepb.Session_ShardSession, rmShards []*vtgatepb.Session_ShardSession) {
+func (txc *TxConn) checkValidCondition(session *SafeSession) error {
+	if len(session.PreSessions) != 0 || len(session.PostSessions) != 0 {
+		return vterrors.VT12001("atomic distributed transaction commit with consistent lookup vindex")
+	}
+	return nil
+}
+
+func (txc *TxConn) errActionAndLogWarn(
+	ctx context.Context,
+	session *SafeSession,
+	txPhase commitPhase,
+	startCommitState querypb.StartCommitState,
+	dtid string,
+	mmShard *vtgatepb.Session_ShardSession,
+	rmShards []*vtgatepb.Session_ShardSession,
+) {
+	var rollbackErr error
 	switch txPhase {
 	case Commit2pcCreateTransaction:
 		// Normal rollback is safe because nothing was prepared yet.
-		if rollbackErr := txc.Rollback(ctx, session); rollbackErr != nil {
-			log.Warningf("Rollback failed after Create Transaction failure: %v", rollbackErr)
-		}
+		rollbackErr = txc.Rollback(ctx, session)
 	case Commit2pcPrepare:
 		// Rollback the prepared and unprepared transactions.
-		if resumeErr := txc.rollbackTx(ctx, dtid, mmShard, rmShards, session.logging); resumeErr != nil {
-			log.Warningf("Rollback failed after Prepare failure: %v", resumeErr)
+		rollbackErr = txc.rollbackTx(ctx, dtid, mmShard, rmShards, session.logging)
+	case Commit2pcStartCommit:
+		// Failed to store the commit decision on MM.
+		// If the failure state is certain, then the only option is to rollback the prepared transactions on the RMs.
+		if startCommitState == querypb.StartCommitState_Fail {
+			rollbackErr = txc.rollbackTx(ctx, dtid, mmShard, rmShards, session.logging)
 		}
+		fallthrough
+	case Commit2pcPrepareCommit:
+		commitUnresolved.Add(1)
 	}
+	if rollbackErr != nil {
+		log.Warningf("Rollback failed after %s failure: %v", phaseMessage[txPhase], rollbackErr)
+		commitUnresolved.Add(1)
+	}
+
 	session.RecordWarning(&querypb.QueryWarning{
 		Code:    uint32(sqlerror.ERInAtomicRecovery),
 		Message: createWarningMessage(dtid, txPhase)})
@@ -427,7 +477,7 @@ func (txc *TxConn) ReleaseAll(ctx context.Context, session *SafeSession) error {
 
 // ResolveTransactions fetches all unresolved transactions and resolves them.
 func (txc *TxConn) ResolveTransactions(ctx context.Context, target *querypb.Target) error {
-	transactions, err := txc.tabletGateway.UnresolvedTransactions(ctx, target)
+	transactions, err := txc.tabletGateway.UnresolvedTransactions(ctx, target, 0 /* abandonAgeSeconds */)
 	if err != nil {
 		return err
 	}
@@ -579,7 +629,7 @@ func (txc *TxConn) UnresolvedTransactions(ctx context.Context, targets []*queryp
 	var tmList []*querypb.TransactionMetadata
 	var mu sync.Mutex
 	err := txc.runTargets(targets, func(target *querypb.Target) error {
-		res, err := txc.tabletGateway.UnresolvedTransactions(ctx, target)
+		res, err := txc.tabletGateway.UnresolvedTransactions(ctx, target, 0 /* abandonAgeSeconds */)
 		if err != nil {
 			return err
 		}

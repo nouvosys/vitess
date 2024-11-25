@@ -37,8 +37,9 @@ import (
 	"vitess.io/vitess/go/vt/logutil"
 	vtschema "vitess.io/vitess/go/vt/schema"
 	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vterrors"
-	"vitess.io/vitess/go/vt/vttablet"
+	vttablet "vitess.io/vitess/go/vt/vttablet/common"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/throttle/throttlerapp"
 
@@ -86,6 +87,7 @@ type vstreamer struct {
 	phase   string
 	vse     *Engine
 	options *binlogdatapb.VStreamOptions
+	config  *vttablet.VReplicationConfig
 }
 
 // streamerPlan extends the original plan to also include
@@ -106,7 +108,7 @@ type streamerPlan struct {
 // filter: the list of filtering rules. If a rule has a select expression for its filter,
 //
 //	the select list can only reference direct columns. No other expressions are allowed.
-//	The select expression is allowed to contain the special 'keyspace_id()' function which
+//	The select expression is allowed to contain the special 'in_keyrange()' function which
 //	will return the keyspace id of the row. Examples:
 //	"select * from t", same as an empty Filter,
 //	"select * from t where in_keyrange('-80')", same as "-80",
@@ -121,6 +123,11 @@ type streamerPlan struct {
 func newVStreamer(ctx context.Context, cp dbconfigs.Connector, se *schema.Engine, startPos string, stopPos string,
 	filter *binlogdatapb.Filter, vschema *localVSchema, throttlerApp throttlerapp.Name,
 	send func([]*binlogdatapb.VEvent) error, phase string, vse *Engine, options *binlogdatapb.VStreamOptions) *vstreamer {
+
+	config, err := GetVReplicationConfig(options)
+	if err != nil {
+		return nil
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	return &vstreamer{
 		ctx:          ctx,
@@ -138,6 +145,7 @@ func newVStreamer(ctx context.Context, cp dbconfigs.Connector, se *schema.Engine
 		phase:        phase,
 		vse:          vse,
 		options:      options,
+		config:       config,
 	}
 }
 
@@ -249,7 +257,7 @@ func (vs *vstreamer) parseEvents(ctx context.Context, events <-chan mysql.Binlog
 			return vs.send(vevents)
 		case binlogdatapb.VEventType_INSERT, binlogdatapb.VEventType_DELETE, binlogdatapb.VEventType_UPDATE, binlogdatapb.VEventType_REPLACE:
 			newSize := len(vevent.GetDml())
-			if curSize+newSize > defaultPacketSize {
+			if curSize+newSize > vs.config.VStreamPacketSize {
 				vs.vse.vstreamerNumPackets.Add(1)
 				vevents := bufferedEvents
 				bufferedEvents = []*binlogdatapb.VEvent{vevent}
@@ -270,7 +278,7 @@ func (vs *vstreamer) parseEvents(ctx context.Context, events <-chan mysql.Binlog
 					newSize += len(rowChange.After.Values)
 				}
 			}
-			if curSize+newSize > defaultPacketSize {
+			if curSize+newSize > vs.config.VStreamPacketSize {
 				vs.vse.vstreamerNumPackets.Add(1)
 				vevents := bufferedEvents
 				bufferedEvents = []*binlogdatapb.VEvent{vevent}
@@ -776,7 +784,7 @@ func (vs *vstreamer) buildTablePlan(id uint64, tm *mysql.TableMap) (*binlogdatap
 		vs.plans[id] = nil
 		return nil, nil
 	}
-	if err := addEnumAndSetMappingstoPlan(plan, cols, tm.Metadata); err != nil {
+	if err := addEnumAndSetMappingstoPlan(vs.se.Environment(), plan, cols, tm.Metadata); err != nil {
 		return nil, vterrors.Wrapf(err, "failed to build ENUM and SET column integer to string mappings")
 	}
 	vs.plans[id] = &streamerPlan{
@@ -996,7 +1004,7 @@ func (vs *vstreamer) processRowEvent(vevents []*binlogdatapb.VEvent, plan *strea
 		}
 		if afterOK {
 			rowChange.After = sqltypes.RowToProto3(afterValues)
-			if (vttablet.VReplicationExperimentalFlags /**/ & /**/ vttablet.VReplicationExperimentalFlagAllowNoBlobBinlogRowImage != 0) &&
+			if (vs.config.ExperimentalFlags /**/ & /**/ vttablet.VReplicationExperimentalFlagAllowNoBlobBinlogRowImage != 0) &&
 				partial {
 
 				rowChange.DataColumns = &binlogdatapb.RowChange_Bitmap{
@@ -1060,7 +1068,7 @@ func (vs *vstreamer) extractRowAndFilter(plan *streamerPlan, data []byte, dataCo
 	partial := false
 	for colNum := 0; colNum < dataColumns.Count(); colNum++ {
 		if !dataColumns.Bit(colNum) {
-			if vttablet.VReplicationExperimentalFlags /**/ & /**/ vttablet.VReplicationExperimentalFlagAllowNoBlobBinlogRowImage == 0 {
+			if vs.config.ExperimentalFlags /**/ & /**/ vttablet.VReplicationExperimentalFlagAllowNoBlobBinlogRowImage == 0 {
 				return false, nil, false, fmt.Errorf("partial row image encountered: ensure binlog_row_image is set to 'full'")
 			} else {
 				partial = true
@@ -1090,13 +1098,13 @@ func (vs *vstreamer) extractRowAndFilter(plan *streamerPlan, data []byte, dataCo
 			// Convert the integer values in the binlog event for any SET and ENUM fields into their
 			// string representations.
 			if plan.Table.Fields[colNum].Type == querypb.Type_ENUM || mysqlType == mysqlbinlog.TypeEnum {
-				value, err = buildEnumStringValue(plan, colNum, value)
+				value, err = buildEnumStringValue(vs.se.Environment(), plan, colNum, value)
 				if err != nil {
 					return false, nil, false, vterrors.Wrapf(err, "failed to perform ENUM column integer to string value mapping")
 				}
 			}
 			if plan.Table.Fields[colNum].Type == querypb.Type_SET || mysqlType == mysqlbinlog.TypeSet {
-				value, err = buildSetStringValue(plan, colNum, value)
+				value, err = buildSetStringValue(vs.se.Environment(), plan, colNum, value)
 				if err != nil {
 					return false, nil, false, vterrors.Wrapf(err, "failed to perform SET column integer to string value mapping")
 				}
@@ -1113,7 +1121,7 @@ func (vs *vstreamer) extractRowAndFilter(plan *streamerPlan, data []byte, dataCo
 }
 
 // addEnumAndSetMappingstoPlan sets up any necessary ENUM and SET integer to string mappings.
-func addEnumAndSetMappingstoPlan(plan *Plan, cols []*querypb.Field, metadata []uint16) error {
+func addEnumAndSetMappingstoPlan(env *vtenv.Environment, plan *Plan, cols []*querypb.Field, metadata []uint16) error {
 	plan.EnumSetValuesMap = make(map[int]map[int]string)
 	for i, col := range cols {
 		// If the column is a CHAR based type with a binary collation (e.g. utf8mb4_bin) then
@@ -1132,21 +1140,25 @@ func addEnumAndSetMappingstoPlan(plan *Plan, cols []*querypb.Field, metadata []u
 				return fmt.Errorf("enum or set column %s does not have valid string values: %s",
 					col.Name, col.ColumnType)
 			}
-			plan.EnumSetValuesMap[i] = vtschema.ParseEnumOrSetTokensMap(col.ColumnType[begin+1 : end])
+			var err error
+			plan.EnumSetValuesMap[i], err = vtschema.ParseEnumOrSetTokensMap(env, col.ColumnType[begin+1:end])
+			if err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
 // buildEnumStringValue takes the integer value of an ENUM column and returns the string value.
-func buildEnumStringValue(plan *streamerPlan, colNum int, value sqltypes.Value) (sqltypes.Value, error) {
+func buildEnumStringValue(env *vtenv.Environment, plan *streamerPlan, colNum int, value sqltypes.Value) (sqltypes.Value, error) {
 	if value.IsNull() { // No work is needed
 		return value, nil
 	}
 	// Add the mappings just-in-time in case we haven't properly received and processed a
 	// table map event to initialize it.
 	if plan.EnumSetValuesMap == nil {
-		if err := addEnumAndSetMappingstoPlan(plan.Plan, plan.Table.Fields, plan.TableMap.Metadata); err != nil {
+		if err := addEnumAndSetMappingstoPlan(env, plan.Plan, plan.Table.Fields, plan.TableMap.Metadata); err != nil {
 			return sqltypes.Value{}, err
 		}
 	}
@@ -1174,14 +1186,14 @@ func buildEnumStringValue(plan *streamerPlan, colNum int, value sqltypes.Value) 
 }
 
 // buildSetStringValue takes the integer value of a SET column and returns the string value.
-func buildSetStringValue(plan *streamerPlan, colNum int, value sqltypes.Value) (sqltypes.Value, error) {
+func buildSetStringValue(env *vtenv.Environment, plan *streamerPlan, colNum int, value sqltypes.Value) (sqltypes.Value, error) {
 	if value.IsNull() { // No work is needed
 		return value, nil
 	}
 	// Add the mappings just-in-time in case we haven't properly received and processed a
 	// table map event to initialize it.
 	if plan.EnumSetValuesMap == nil {
-		if err := addEnumAndSetMappingstoPlan(plan.Plan, plan.Table.Fields, plan.TableMap.Metadata); err != nil {
+		if err := addEnumAndSetMappingstoPlan(env, plan.Plan, plan.Table.Fields, plan.TableMap.Metadata); err != nil {
 			return sqltypes.Value{}, err
 		}
 	}

@@ -29,13 +29,18 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/google/uuid"
 	"golang.org/x/exp/maps"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/prototext"
 	"google.golang.org/protobuf/proto"
 
+	"vitess.io/vitess/go/constants/sidecar"
 	"vitess.io/vitess/go/protoutil"
+	"vitess.io/vitess/go/ptr"
 	"vitess.io/vitess/go/sets"
 	"vitess.io/vitess/go/sqlescape"
 	"vitess.io/vitess/go/sqltypes"
@@ -44,6 +49,7 @@ import (
 	"vitess.io/vitess/go/vt/concurrency"
 	"vitess.io/vitess/go/vt/discovery"
 	"vitess.io/vitess/go/vt/key"
+	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/mysqlctl/tmutils"
 	"vitess.io/vitess/go/vt/schema"
@@ -142,9 +148,9 @@ var (
 	// ErrMultipleTargetKeyspaces occurs when a workflow somehow has multiple
 	// target keyspaces across different shard primaries. This should be
 	// impossible.
-	ErrMultipleTargetKeyspaces   = errors.New("multiple target keyspaces for a single workflow")
-	ErrWorkflowNotFullySwitched  = errors.New("cannot complete workflow because you have not yet switched all read and write traffic")
-	ErrWorkflowPartiallySwitched = errors.New("cannot cancel workflow because you have already switched some or all read and write traffic")
+	ErrMultipleTargetKeyspaces          = errors.New("multiple target keyspaces for a single workflow")
+	ErrWorkflowCompleteNotFullySwitched = errors.New("cannot complete workflow because you have not yet switched all read and write traffic")
+	ErrWorkflowDeleteWritesSwitched     = errors.New("cannot delete workflow because you have already switched write traffic")
 )
 
 // Server provides an API to work with Vitess workflows, like vreplication
@@ -299,7 +305,8 @@ func (s *Server) GetCellsWithShardReadsSwitched(
 // keyspace.
 func (s *Server) GetCellsWithTableReadsSwitched(
 	ctx context.Context,
-	keyspace string,
+	sourceKeyspace string,
+	targetKeyspace string,
 	table string,
 	tabletType topodatapb.TabletType,
 ) (cellsSwitched []string, cellsNotSwitched []string, err error) {
@@ -329,7 +336,7 @@ func (s *Server) GetCellsWithTableReadsSwitched(
 		)
 
 		for _, rule := range srvVSchema.RoutingRules.Rules {
-			ruleName := fmt.Sprintf("%s.%s@%s", keyspace, table, strings.ToLower(tabletType.String()))
+			ruleName := fmt.Sprintf("%s.%s@%s", sourceKeyspace, table, strings.ToLower(tabletType.String()))
 			if rule.FromTable == ruleName {
 				found = true
 
@@ -340,7 +347,7 @@ func (s *Server) GetCellsWithTableReadsSwitched(
 						return nil, nil, err
 					}
 
-					if ks == keyspace {
+					if ks != sourceKeyspace {
 						switched = true
 						break // if one table in the workflow switched, we are done.
 					}
@@ -858,8 +865,8 @@ ORDER BY
 
 					if stream.Id > streamLog.StreamId {
 						s.Logger().Warningf("Found stream log for nonexistent stream: %+v", streamLog)
-						// This can happen on manual/failed workflow cleanup so keep going.
-						continue
+						// This can happen on manual/failed workflow cleanup so move to the next log.
+						break
 					}
 
 					// stream.Id == streamLog.StreamId
@@ -944,6 +951,10 @@ ORDER BY
 	}, nil
 }
 
+func (s *Server) GetWorkflowState(ctx context.Context, targetKeyspace, workflowName string) (*trafficSwitcher, *State, error) {
+	return s.getWorkflowState(ctx, targetKeyspace, workflowName)
+}
+
 func (s *Server) getWorkflowState(ctx context.Context, targetKeyspace, workflowName string) (*trafficSwitcher, *State, error) {
 	ts, err := s.buildTrafficSwitcher(ctx, targetKeyspace, workflowName)
 	if err != nil {
@@ -1013,12 +1024,12 @@ func (s *Server) getWorkflowState(ctx context.Context, targetKeyspace, workflowN
 				}
 			}
 		} else {
-			state.RdonlyCellsSwitched, state.RdonlyCellsNotSwitched, err = s.GetCellsWithTableReadsSwitched(ctx, targetKeyspace, table, topodatapb.TabletType_RDONLY)
+			state.RdonlyCellsSwitched, state.RdonlyCellsNotSwitched, err = s.GetCellsWithTableReadsSwitched(ctx, sourceKeyspace, targetKeyspace, table, topodatapb.TabletType_RDONLY)
 			if err != nil {
 				return nil, nil, err
 			}
 
-			state.ReplicaCellsSwitched, state.ReplicaCellsNotSwitched, err = s.GetCellsWithTableReadsSwitched(ctx, targetKeyspace, table, topodatapb.TabletType_REPLICA)
+			state.ReplicaCellsSwitched, state.ReplicaCellsNotSwitched, err = s.GetCellsWithTableReadsSwitched(ctx, sourceKeyspace, targetKeyspace, table, topodatapb.TabletType_REPLICA)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -1027,10 +1038,11 @@ func (s *Server) getWorkflowState(ctx context.Context, targetKeyspace, workflowN
 				return nil, nil, err
 			}
 			for _, table := range ts.Tables() {
-				rr := globalRules[table]
-				// If a rule exists for the table and points to the target keyspace, then
-				// writes have been switched.
-				if len(rr) > 0 && rr[0] == fmt.Sprintf("%s.%s", targetKeyspace, table) {
+				// If a rule for the primary tablet type exists for any table and points to the target keyspace,
+				// then writes have been switched.
+				ruleKey := fmt.Sprintf("%s.%s", sourceKeyspace, table)
+				rr := globalRules[ruleKey]
+				if len(rr) > 0 && rr[0] != ruleKey {
 					state.WritesSwitched = true
 					break
 				}
@@ -1126,22 +1138,33 @@ func (s *Server) LookupVindexCreate(ctx context.Context, req *vtctldatapb.Lookup
 	span.Annotate("cells", req.Cells)
 	span.Annotate("tablet_types", req.TabletTypes)
 
-	ms, sourceVSchema, targetVSchema, err := s.prepareCreateLookup(ctx, req.Workflow, req.Keyspace, req.Vindex, req.ContinueAfterCopyWithOwner)
+	ms, sourceVSchema, targetVSchema, cancelFunc, err := s.prepareCreateLookup(ctx, req.Workflow, req.Keyspace, req.Vindex, req.ContinueAfterCopyWithOwner)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.ts.SaveVSchema(ctx, ms.TargetKeyspace, targetVSchema); err != nil {
-		return nil, err
-	}
 
+	if err := s.ts.SaveVSchema(ctx, ms.TargetKeyspace, targetVSchema); err != nil {
+		return nil, vterrors.Wrapf(err, "failed to save updated vschema '%v' in the %s keyspace",
+			targetVSchema, ms.TargetKeyspace)
+	}
 	ms.TabletTypes = topoproto.MakeStringTypeCSV(req.TabletTypes)
 	ms.TabletSelectionPreference = req.TabletSelectionPreference
 	if err := s.Materialize(ctx, ms); err != nil {
+		if cancelFunc != nil {
+			if cerr := cancelFunc(); cerr != nil {
+				err = vterrors.Wrapf(err, "failed to restore original vschema '%v' in the %s keyspace: %v",
+					targetVSchema, ms.TargetKeyspace, cerr)
+			}
+		}
 		return nil, err
 	}
-	if err := s.ts.SaveVSchema(ctx, req.Keyspace, sourceVSchema); err != nil {
-		return nil, err
+	if ms.SourceKeyspace != ms.TargetKeyspace {
+		if err := s.ts.SaveVSchema(ctx, ms.SourceKeyspace, sourceVSchema); err != nil {
+			return nil, vterrors.Wrapf(err, "failed to save updated vschema '%v' in the %s keyspace",
+				sourceVSchema, ms.SourceKeyspace)
+		}
 	}
+
 	if err := s.ts.RebuildSrvVSchema(ctx, nil); err != nil {
 		return nil, err
 	}
@@ -1175,25 +1198,7 @@ func (s *Server) LookupVindexExternalize(ctx context.Context, req *vtctldatapb.L
 		return nil, err
 	}
 
-	// Create a parallelizer function.
-	forAllTargets := func(f func(*topo.ShardInfo) error) error {
-		var wg sync.WaitGroup
-		allErrors := &concurrency.AllErrorRecorder{}
-		for _, targetShard := range targetShards {
-			wg.Add(1)
-			go func(targetShard *topo.ShardInfo) {
-				defer wg.Done()
-
-				if err := f(targetShard); err != nil {
-					allErrors.RecordError(err)
-				}
-			}(targetShard)
-		}
-		wg.Wait()
-		return allErrors.AggrError(vterrors.Aggregate)
-	}
-
-	err = forAllTargets(func(targetShard *topo.ShardInfo) error {
+	err = forAllShards(targetShards, func(targetShard *topo.ShardInfo) error {
 		targetPrimary, err := s.ts.GetTablet(ctx, targetShard.PrimaryAlias)
 		if err != nil {
 			return err
@@ -1277,6 +1282,21 @@ func (s *Server) Materialize(ctx context.Context, ms *vtctldatapb.MaterializeSet
 		cells[i] = strings.TrimSpace(cells[i])
 	}
 
+	switch {
+	case len(ms.ReferenceTables) == 0 && len(ms.TableSettings) == 0:
+		return vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "either --table-settings or --reference-tables must be specified")
+	case len(ms.ReferenceTables) > 0 && len(ms.TableSettings) > 0:
+		return vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "cannot specify both --table-settings and --reference-tables")
+	}
+
+	for _, table := range ms.ReferenceTables {
+		ms.TableSettings = append(ms.TableSettings, &vtctldatapb.TableMaterializeSettings{
+			TargetTable:      table,
+			SourceExpression: fmt.Sprintf("select * from %s", table),
+			CreateDdl:        createDDLAsCopyDropForeignKeys,
+		})
+	}
+
 	err = mz.createWorkflowStreams(&tabletmanagerdatapb.CreateVReplicationWorkflowRequest{
 		Workflow:                  ms.Workflow,
 		Cells:                     strings.Split(ms.Cell, ","),
@@ -1322,6 +1342,21 @@ func (s *Server) moveTablesCreate(ctx context.Context, req *vtctldatapb.MoveTabl
 		sourceTopo   = s.ts
 	)
 
+	if req.GetWorkflowOptions() != nil && req.WorkflowOptions.GlobalKeyspace != "" {
+		// Confirm that the keyspace exists and it is unsharded.
+		gvs, err := s.ts.GetVSchema(ctx, req.WorkflowOptions.GlobalKeyspace)
+		if err != nil {
+			if topo.IsErrType(err, topo.NoNode) {
+				return nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "global-keyspace %s does not exist", req.WorkflowOptions.GlobalKeyspace)
+			}
+			return nil, vterrors.Wrapf(err, "failed to validate global-keyspace")
+		}
+		if gvs.Sharded {
+			return nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "global-keyspace %s is sharded and thus cannot be used for global resources",
+				req.WorkflowOptions.GlobalKeyspace)
+		}
+	}
+
 	// When the source is an external cluster mounted using the Mount command.
 	if req.ExternalClusterName != "" {
 		externalTopo, err = s.ts.OpenExternalVitessClusterServer(ctx, req.ExternalClusterName)
@@ -1359,7 +1394,7 @@ func (s *Server) moveTablesCreate(ctx context.Context, req *vtctldatapb.MoveTabl
 		return nil, err
 	}
 	if len(tables) > 0 {
-		err = s.validateSourceTablesExist(ctx, sourceKeyspace, ksTables, tables)
+		err = validateSourceTablesExist(ctx, sourceKeyspace, ksTables, tables)
 		if err != nil {
 			return nil, err
 		}
@@ -1371,7 +1406,7 @@ func (s *Server) moveTablesCreate(ctx context.Context, req *vtctldatapb.MoveTabl
 		}
 	}
 	if len(req.ExcludeTables) > 0 {
-		err = s.validateSourceTablesExist(ctx, sourceKeyspace, ksTables, req.ExcludeTables)
+		err = validateSourceTablesExist(ctx, sourceKeyspace, ksTables, req.ExcludeTables)
 		if err != nil {
 			return nil, err
 		}
@@ -1389,10 +1424,13 @@ func (s *Server) moveTablesCreate(ctx context.Context, req *vtctldatapb.MoveTabl
 	s.Logger().Infof("Found tables to move: %s", strings.Join(tables, ","))
 
 	if !vschema.Sharded {
-		// Save the original in case we need to restore it for a late failure
-		// in the defer().
+		// Save the original in case we need to restore it for a late failure in
+		// the defer().
 		origVSchema = vschema.CloneVT()
 		if err := s.addTablesToVSchema(ctx, sourceKeyspace, vschema, tables, externalTopo == nil); err != nil {
+			return nil, err
+		}
+		if err := s.ts.SaveVSchema(ctx, targetKeyspace, vschema); err != nil {
 			return nil, err
 		}
 	}
@@ -1468,7 +1506,7 @@ func (s *Server) moveTablesCreate(ctx context.Context, req *vtctldatapb.MoveTabl
 	ctx, workflowUnlock, lockErr := s.ts.LockName(ctx, lockName, "MoveTablesCreate")
 	if lockErr != nil {
 		ts.Logger().Errorf("Locking the workflow %s failed: %v", lockName, lockErr)
-		return nil, lockErr
+		return nil, vterrors.Wrapf(lockErr, "failed to lock the %s workflow", lockName)
 	}
 	defer workflowUnlock(&err)
 	ctx, targetUnlock, lockErr := sw.lockKeyspace(ctx, ts.TargetKeyspaceName(), "MoveTablesCreate")
@@ -1503,11 +1541,6 @@ func (s *Server) moveTablesCreate(ctx context.Context, req *vtctldatapb.MoveTabl
 	// routing rules and denied tables entries in place.
 	if externalTopo == nil {
 		if err := s.setupInitialRoutingRules(ctx, req, mz, tables); err != nil {
-			return nil, err
-		}
-
-		// We added to the vschema.
-		if err := s.ts.SaveVSchema(ctx, targetKeyspace, vschema); err != nil {
 			return nil, err
 		}
 	}
@@ -1670,6 +1703,15 @@ func (s *Server) MoveTablesComplete(ctx context.Context, req *vtctldatapb.MoveTa
 		return nil, err
 	}
 
+	// Lock the workflow while we complete it.
+	lockName := fmt.Sprintf("%s/%s", ts.TargetKeyspaceName(), ts.WorkflowName())
+	ctx, workflowUnlock, lockErr := s.ts.LockName(ctx, lockName, "MoveTablesComplete")
+	if lockErr != nil {
+		ts.Logger().Errorf("Locking the workflow %s failed: %v", lockName, lockErr)
+		return nil, vterrors.Wrapf(lockErr, "failed to lock the %s workflow", lockName)
+	}
+	defer workflowUnlock(&err)
+
 	var summary string
 	if req.DryRun {
 		summary = fmt.Sprintf("Complete dry run results for workflow %s.%s at %v", req.TargetKeyspace, req.Workflow, time.Now().UTC().Format(time.RFC822))
@@ -1694,7 +1736,7 @@ func (s *Server) MoveTablesComplete(ctx context.Context, req *vtctldatapb.MoveTa
 	}
 
 	if !state.WritesSwitched || len(state.ReplicaCellsNotSwitched) > 0 || len(state.RdonlyCellsNotSwitched) > 0 {
-		return nil, ErrWorkflowNotFullySwitched
+		return nil, ErrWorkflowCompleteNotFullySwitched
 	}
 	var renameTable TableRemovalType
 	if req.RenameTables {
@@ -1738,8 +1780,7 @@ func (s *Server) ReshardCreate(ctx context.Context, req *vtctldatapb.ReshardCrea
 		s.Logger().Errorf("%v", err2)
 		return nil, err
 	}
-	tabletTypesStr := discovery.BuildTabletTypesString(req.TabletTypes, req.TabletSelectionPreference)
-	rs, err := s.buildResharder(ctx, keyspace, req.Workflow, req.SourceShards, req.TargetShards, strings.Join(cells, ","), tabletTypesStr)
+	rs, err := s.buildResharder(ctx, req)
 	if err != nil {
 		return nil, vterrors.Wrap(err, "buildResharder")
 	}
@@ -1785,9 +1826,25 @@ func (s *Server) VDiffCreate(ctx context.Context, req *vtctldatapb.VDiffCreateRe
 	span.Annotate("tables", req.Tables)
 	span.Annotate("auto_retry", req.AutoRetry)
 	span.Annotate("max_diff_duration", req.MaxDiffDuration)
+	if req.AutoStart != nil {
+		span.Annotate("auto_start", req.GetAutoStart())
+	}
+
+	var err error
+	req.Uuid = strings.TrimSpace(req.Uuid)
+	if req.Uuid == "" { // Generate a UUID
+		req.Uuid = uuid.New().String()
+	} else { // Validate UUID if provided
+		if err = uuid.Validate(req.Uuid); err != nil {
+			return nil, vterrors.Wrapf(err, "invalid UUID provided: %s", req.Uuid)
+		}
+	}
 
 	tabletTypesStr := discovery.BuildTabletTypesString(req.TabletTypes, req.TabletSelectionPreference)
 
+	if req.Limit == 0 { // This would produce no useful results
+		req.Limit = math.MaxInt64
+	}
 	// This is a pointer so there's no ZeroValue in the message
 	// and an older v18 client will not provide it.
 	if req.MaxDiffDuration == nil {
@@ -1797,10 +1854,18 @@ func (s *Server) VDiffCreate(ctx context.Context, req *vtctldatapb.VDiffCreateRe
 	// client should always provide them, but we check anyway to
 	// be safe.
 	if req.FilteredReplicationWaitTime == nil {
-		req.FilteredReplicationWaitTime = &vttimepb.Duration{}
+		// A value of 0 is not valid as the vdiff will never succeed.
+		req.FilteredReplicationWaitTime = &vttimepb.Duration{
+			Seconds: int64(DefaultTimeout.Seconds()),
+		}
 	}
 	if req.WaitUpdateInterval == nil {
 		req.WaitUpdateInterval = &vttimepb.Duration{}
+	}
+
+	autoStart := true
+	if req.AutoStart != nil {
+		autoStart = req.GetAutoStart()
 	}
 
 	options := &tabletmanagerdatapb.VDiffOptions{
@@ -1817,6 +1882,7 @@ func (s *Server) VDiffCreate(ctx context.Context, req *vtctldatapb.VDiffCreateRe
 			MaxExtraRowsToCompare: req.MaxExtraRowsToCompare,
 			UpdateTableStats:      req.UpdateTableStats,
 			MaxDiffSeconds:        req.MaxDiffDuration.Seconds,
+			AutoStart:             &autoStart,
 		},
 		ReportOptions: &tabletmanagerdatapb.VDiffReportOptions{
 			OnlyPks:                 req.OnlyPKs,
@@ -1905,9 +1971,12 @@ func (s *Server) VDiffResume(ctx context.Context, req *vtctldatapb.VDiffResumeRe
 	span, ctx := trace.NewSpan(ctx, "workflow.Server.VDiffResume")
 	defer span.Finish()
 
+	targetShards := req.GetTargetShards()
+
 	span.Annotate("keyspace", req.TargetKeyspace)
 	span.Annotate("workflow", req.Workflow)
 	span.Annotate("uuid", req.Uuid)
+	span.Annotate("target_shards", targetShards)
 
 	tabletreq := &tabletmanagerdatapb.VDiffRequest{
 		Keyspace:  req.TargetKeyspace,
@@ -1919,6 +1988,12 @@ func (s *Server) VDiffResume(ctx context.Context, req *vtctldatapb.VDiffResumeRe
 	ts, err := s.buildTrafficSwitcher(ctx, req.TargetKeyspace, req.Workflow)
 	if err != nil {
 		return nil, err
+	}
+
+	if len(targetShards) > 0 {
+		if err := applyTargetShards(ts, targetShards); err != nil {
+			return nil, err
+		}
 	}
 
 	err = ts.ForAllTargets(func(target *MigrationTarget) error {
@@ -1979,9 +2054,12 @@ func (s *Server) VDiffStop(ctx context.Context, req *vtctldatapb.VDiffStopReques
 	span, ctx := trace.NewSpan(ctx, "workflow.Server.VDiffStop")
 	defer span.Finish()
 
+	targetShards := req.GetTargetShards()
+
 	span.Annotate("keyspace", req.TargetKeyspace)
 	span.Annotate("workflow", req.Workflow)
 	span.Annotate("uuid", req.Uuid)
+	span.Annotate("target_shards", targetShards)
 
 	tabletreq := &tabletmanagerdatapb.VDiffRequest{
 		Keyspace:  req.TargetKeyspace,
@@ -1993,6 +2071,12 @@ func (s *Server) VDiffStop(ctx context.Context, req *vtctldatapb.VDiffStopReques
 	ts, err := s.buildTrafficSwitcher(ctx, req.TargetKeyspace, req.Workflow)
 	if err != nil {
 		return nil, err
+	}
+
+	if len(targetShards) > 0 {
+		if err := applyTargetShards(ts, targetShards); err != nil {
+			return nil, err
+		}
 	}
 
 	err = ts.ForAllTargets(func(target *MigrationTarget) error {
@@ -2027,11 +2111,22 @@ func (s *Server) WorkflowDelete(ctx context.Context, req *vtctldatapb.WorkflowDe
 	}
 
 	if ts.workflowType != binlogdatapb.VReplicationWorkflowType_CreateLookupIndex {
-		// Return an error if the workflow traffic is partially switched.
-		if state.WritesSwitched || len(state.ReplicaCellsSwitched) > 0 || len(state.RdonlyCellsSwitched) > 0 {
-			return nil, ErrWorkflowPartiallySwitched
+		// Return an error if the write workflow traffic is switched.
+		if state.WritesSwitched {
+			return nil, ErrWorkflowDeleteWritesSwitched
 		}
+		// If only reads have been switched, then we can delete the
+		// workflow and its related artifacts.
 	}
+
+	// Lock the workflow for deletion.
+	lockName := fmt.Sprintf("%s/%s", ts.TargetKeyspaceName(), ts.WorkflowName())
+	ctx, workflowUnlock, lockErr := s.ts.LockName(ctx, lockName, "WorkflowDelete")
+	if lockErr != nil {
+		ts.Logger().Errorf("Locking the workflow %s failed: %v", lockName, lockErr)
+		return nil, vterrors.Wrapf(lockErr, "failed to lock the %s workflow", lockName)
+	}
+	defer workflowUnlock(&err)
 
 	if state.WorkflowType == TypeMigrate {
 		_, err := s.finalizeMigrateWorkflow(ctx, ts, "", true, req.GetKeepData(), req.GetKeepRoutingRules(), false)
@@ -2053,25 +2148,43 @@ func (s *Server) WorkflowDelete(ctx context.Context, req *vtctldatapb.WorkflowDe
 		s.optimizeCopyStateTable(tablet.Tablet)
 		return res.Result, err
 	}
-	delCtx, delCancel := context.WithTimeout(ctx, topo.RemoteOperationTimeout*2)
-	defer delCancel()
-	res, err := vx.CallbackContext(delCtx, callback)
-	if err != nil {
-		return nil, err
-	}
 
-	if len(res) == 0 {
-		return nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "the %s workflow does not exist in the %s keyspace", req.Workflow, req.Keyspace)
+	// Multi-tenant migrations delete only that tenant's records from the target tables
+	// in batches and we may not be able to complete that work before the timeout. We
+	// delete the workflow only after the cleanup work completes successfully so the
+	// workflow can be canceled multiple times if needed in order to fully cleanup
+	// all of the tenant's data that we had copied.
+	if ts.IsMultiTenantMigration() {
+		if ts.workflowType != binlogdatapb.VReplicationWorkflowType_MoveTables { // Should never happen
+			return nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "unsupported workflow type %q for multi-tenant migration",
+				ts.workflowType)
+		}
+		// We need to delete the rows that the target tables would have for the tenant.
+		if !req.GetKeepData() {
+			if err := s.deleteTenantData(ctx, ts, req.DeleteBatchSize); err != nil {
+				return nil, vterrors.Wrapf(err, "failed to fully delete all migrated data for tenant %s, please retry the operation",
+					ts.options.TenantId)
+			}
+		}
 	}
 
 	// Cleanup related data and artifacts. There are none for a LookupVindex workflow.
 	if ts.workflowType != binlogdatapb.VReplicationWorkflowType_CreateLookupIndex {
-		if _, err := s.DropTargets(delCtx, ts, req.GetKeepData(), req.GetKeepRoutingRules(), false); err != nil {
+		if _, err := s.dropTargets(ctx, ts, req.GetKeepData(), req.GetKeepRoutingRules(), false); err != nil {
 			if topo.IsErrType(err, topo.NoNode) {
 				return nil, vterrors.Wrapf(err, "%s keyspace does not exist", req.GetKeyspace())
 			}
 			return nil, err
 		}
+	}
+
+	// Now that we've succesfully cleaned up everything else, we can finally delete
+	// the workflow.
+	delCtx, delCancel := context.WithTimeout(ctx, topo.RemoteOperationTimeout*2)
+	defer delCancel()
+	res, err := vx.CallbackContext(delCtx, callback)
+	if err != nil {
+		return nil, err
 	}
 
 	response := &vtctldatapb.WorkflowDeleteResponse{}
@@ -2135,7 +2248,6 @@ func (s *Server) WorkflowStatus(ctx context.Context, req *vtctldatapb.WorkflowSt
 	if err != nil {
 		return nil, err
 	}
-
 	// The stream key is target keyspace/tablet alias, e.g. 0/test-0000000100.
 	// We sort the keys for intuitive and consistent output.
 	streamKeys := make([]string, 0, len(workflow.ShardStreams))
@@ -2191,9 +2303,13 @@ func (s *Server) WorkflowStatus(ctx context.Context, req *vtctldatapb.WorkflowSt
 	return resp, nil
 }
 
-// GetCopyProgress returns the progress of all tables being copied in the
-// workflow.
+// GetCopyProgress returns the progress of all tables being copied in the workflow.
 func (s *Server) GetCopyProgress(ctx context.Context, ts *trafficSwitcher, state *State) (*copyProgress, error) {
+	if ts.workflowType == binlogdatapb.VReplicationWorkflowType_Migrate {
+		// The logic below expects the source primaries to be in the same cluster as the target.
+		// For now we don't report progress for Migrate workflows.
+		return nil, nil
+	}
 	getTablesQuery := "select distinct table_name from _vt.copy_state cs, _vt.vreplication vr where vr.id = cs.vrepl_id and vr.id = %d"
 	getRowCountQuery := "select table_name, table_rows, data_length from information_schema.tables where table_schema = %s and table_name in (%s)"
 	tables := make(map[string]bool)
@@ -2335,6 +2451,7 @@ func (s *Server) WorkflowUpdate(ctx context.Context, req *vtctldatapb.WorkflowUp
 	span.Annotate("tablet_types", req.TabletRequest.TabletTypes)
 	span.Annotate("on_ddl", req.TabletRequest.OnDdl)
 	span.Annotate("state", req.TabletRequest.State)
+	span.Annotate("config_overrides", req.TabletRequest.ConfigOverrides)
 
 	vx := vexec.NewVExec(req.Keyspace, req.TabletRequest.Workflow, s.ts, s.tmc, s.env.Parser())
 	callback := func(ctx context.Context, tablet *topo.TabletInfo) (*querypb.QueryResult, error) {
@@ -2370,32 +2487,6 @@ func (s *Server) WorkflowUpdate(ctx context.Context, req *vtctldatapb.WorkflowUp
 	}
 	response.Details = details
 	return response, nil
-}
-
-// validateSourceTablesExist validates that tables provided are present
-// in the source keyspace.
-func (s *Server) validateSourceTablesExist(ctx context.Context, sourceKeyspace string, ksTables, tables []string) error {
-	var missingTables []string
-	for _, table := range tables {
-		if schema.IsInternalOperationTableName(table) {
-			continue
-		}
-		found := false
-
-		for _, ksTable := range ksTables {
-			if table == ksTable {
-				found = true
-				break
-			}
-		}
-		if !found {
-			missingTables = append(missingTables, table)
-		}
-	}
-	if len(missingTables) > 0 {
-		return vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "table(s) not found in source keyspace %s: %s", sourceKeyspace, strings.Join(missingTables, ","))
-	}
-	return nil
 }
 
 // addTablesToVSchema adds tables to an (unsharded) vschema if they are not already defined.
@@ -2436,7 +2527,7 @@ func (s *Server) addTablesToVSchema(ctx context.Context, sourceKeyspace string, 
 func (s *Server) collectTargetStreams(ctx context.Context, mz *materializer) ([]string, error) {
 	var shardTablets []string
 	var mu sync.Mutex
-	err := mz.forAllTargets(func(target *topo.ShardInfo) error {
+	err := forAllShards(mz.targetShards, func(target *topo.ShardInfo) error {
 		var err error
 		targetPrimary, err := s.ts.GetTablet(ctx, target.PrimaryAlias)
 		if err != nil {
@@ -2462,30 +2553,13 @@ func (s *Server) collectTargetStreams(ctx context.Context, mz *materializer) ([]
 }
 
 func (s *Server) checkIfPreviousJournalExists(ctx context.Context, mz *materializer, migrationID int64) (bool, []string, error) {
-	forAllSources := func(f func(*topo.ShardInfo) error) error {
-		var wg sync.WaitGroup
-		allErrors := &concurrency.AllErrorRecorder{}
-		for _, sourceShard := range mz.sourceShards {
-			wg.Add(1)
-			go func(sourceShard *topo.ShardInfo) {
-				defer wg.Done()
-
-				if err := f(sourceShard); err != nil {
-					allErrors.RecordError(err)
-				}
-			}(sourceShard)
-		}
-		wg.Wait()
-		return allErrors.AggrError(vterrors.Aggregate)
-	}
-
 	var (
 		mu      sync.Mutex
 		exists  bool
 		tablets []string
 	)
 
-	err := forAllSources(func(si *topo.ShardInfo) error {
+	err := forAllShards(mz.sourceShards, func(si *topo.ShardInfo) error {
 		tablet, err := s.ts.GetTablet(ctx, si.PrimaryAlias)
 		if err != nil {
 			return err
@@ -2572,9 +2646,9 @@ func (s *Server) optimizeCopyStateTable(tablet *topodatapb.Tablet) {
 	}()
 }
 
-// DropTargets cleans up target tables, shards and denied tables if a MoveTables/Reshard
-// is cancelled.
-func (s *Server) DropTargets(ctx context.Context, ts *trafficSwitcher, keepData, keepRoutingRules, dryRun bool) (*[]string, error) {
+// dropTargets cleans up target tables, shards and denied tables if a MoveTables/Reshard
+// is canceled.
+func (s *Server) dropTargets(ctx context.Context, ts *trafficSwitcher, keepData, keepRoutingRules, dryRun bool) (*[]string, error) {
 	var err error
 	ts.keepRoutingRules = keepRoutingRules
 	var sw iswitcher
@@ -2584,32 +2658,50 @@ func (s *Server) DropTargets(ctx context.Context, ts *trafficSwitcher, keepData,
 		sw = &switcher{s: s, ts: ts}
 	}
 
-	// Lock the workflow along with its source and target keyspaces.
-	lockName := fmt.Sprintf("%s/%s", ts.TargetKeyspaceName(), ts.WorkflowName())
-	ctx, workflowUnlock, lockErr := s.ts.LockName(ctx, lockName, "DropTargets")
-	if lockErr != nil {
-		return defaultErrorHandler(ts.Logger(), fmt.Sprintf("failed to lock the %s workflow", lockName), lockErr)
-	}
-	defer workflowUnlock(&err)
+	// Lock the source and target keyspaces.
 	ctx, sourceUnlock, lockErr := sw.lockKeyspace(ctx, ts.SourceKeyspaceName(), "DropTargets")
 	if lockErr != nil {
-		return defaultErrorHandler(ts.Logger(), fmt.Sprintf("failed to lock the %s keyspace", ts.SourceKeyspaceName()), lockErr)
+		return defaultErrorHandler(ts.Logger(), fmt.Sprintf("failed to lock the %s keyspace", ts.SourceKeyspaceName()),
+			lockErr)
 	}
 	defer sourceUnlock(&err)
 	if ts.TargetKeyspaceName() != ts.SourceKeyspaceName() {
 		lockCtx, targetUnlock, lockErr := sw.lockKeyspace(ctx, ts.TargetKeyspaceName(), "DropTargets")
 		if lockErr != nil {
-			return defaultErrorHandler(ts.Logger(), fmt.Sprintf("failed to lock the %s keyspace", ts.TargetKeyspaceName()), lockErr)
+			return defaultErrorHandler(ts.Logger(), fmt.Sprintf("failed to lock the %s keyspace", ts.TargetKeyspaceName()),
+				lockErr)
 		}
 		defer targetUnlock(&err)
 		ctx = lockCtx
 	}
 
+	// Stop the workflow before we delete the artifacts so that it doesn't try and
+	// continue doing work, and producing errors, as we delete the related artifacts.
+	if err = ts.ForAllTargets(func(target *MigrationTarget) error {
+		primary := target.GetPrimary()
+		if primary == nil {
+			return vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "no primary tablet found for target shard %s/%s",
+				ts.targetKeyspace, target.GetShard())
+		}
+		_, err := ts.ws.tmc.UpdateVReplicationWorkflow(ctx, primary.Tablet, &tabletmanagerdatapb.UpdateVReplicationWorkflowRequest{
+			Workflow: ts.workflow,
+			State:    ptr.Of(binlogdatapb.VReplicationWorkflowState_Stopped),
+		})
+		if err != nil {
+			return vterrors.Wrapf(err, "failed to stop workflow %s on shard %s/%s", ts.workflow, primary.Keyspace, primary.Shard)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
 	if !keepData {
 		switch ts.MigrationType() {
 		case binlogdatapb.MigrationType_TABLES:
-			if err := sw.removeTargetTables(ctx); err != nil {
-				return nil, err
+			if !ts.IsMultiTenantMigration() {
+				if err := sw.removeTargetTables(ctx); err != nil {
+					return nil, err
+				}
 			}
 			if err := sw.dropSourceDeniedTables(ctx); err != nil {
 				return nil, err
@@ -2630,6 +2722,56 @@ func (s *Server) DropTargets(ctx context.Context, ts *trafficSwitcher, keepData,
 		return nil, err
 	}
 	return sw.logs(), nil
+}
+
+// deleteTenantData attempts to delete all of the tenant's data that was migrated
+// in the workflow that we are canceling or deleting. This work can take some
+// time so if the context ends then the user will need to retry.
+func (s *Server) deleteTenantData(ctx context.Context, ts *trafficSwitcher, batchSize int64) error {
+	if ts.workflowType != binlogdatapb.VReplicationWorkflowType_MoveTables {
+		return vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "unsupported workflow type %q for multi-tenant migration",
+			ts.workflowType)
+	}
+	if ts.options == nil || strings.TrimSpace(ts.options.TenantId) == "" {
+		return vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "missing tenant ID in the workflow options")
+	}
+	if len(ts.tables) == 0 { // Nothing to delete
+		return nil
+	}
+
+	tenantPredicate, err := ts.buildTenantPredicate(ctx)
+	if err != nil {
+		return vterrors.Wrap(err, "failed to build delete filter")
+	}
+	deleteFilter := sqlparser.String(&sqlparser.Where{Expr: *tenantPredicate})
+
+	tableFilters := make(map[string]string, len(ts.tables))
+	for _, table := range ts.tables {
+		tableFilters[table] = deleteFilter
+	}
+
+	return ts.ForAllTargets(func(target *MigrationTarget) error {
+		primary := target.GetPrimary()
+		if primary == nil {
+			return vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "no primary tablet found for target shard %s/%s",
+				ts.targetKeyspace, target.GetShard())
+		}
+		// Let's be sure that the workflow is stopped so that it's not generating more data.
+		_, err := ts.ws.tmc.UpdateVReplicationWorkflow(ctx, primary.Tablet, &tabletmanagerdatapb.UpdateVReplicationWorkflowRequest{
+			Workflow: ts.workflow,
+			State:    ptr.Of(binlogdatapb.VReplicationWorkflowState_Stopped),
+		})
+		if err != nil {
+			return vterrors.Wrapf(err, "failed to stop workflow %s on shard %s/%s", ts.workflow, primary.Keyspace, primary.Shard)
+		}
+		s.Logger().Infof("Deleting tenant %s data that was migrated in mulit-tenant workflow %s",
+			ts.workflow, ts.options.TenantId)
+		_, err = ts.ws.tmc.DeleteTableData(ctx, primary.Tablet, &tabletmanagerdatapb.DeleteTableDataRequest{
+			TableFilters: tableFilters,
+			BatchSize:    batchSize,
+		})
+		return err
+	})
 }
 
 func (s *Server) buildTrafficSwitcher(ctx context.Context, targetKeyspace, workflowName string) (*trafficSwitcher, error) {
@@ -2677,6 +2819,10 @@ func (s *Server) buildTrafficSwitcher(ctx context.Context, targetKeyspace, workf
 				}
 			} else if ts.sourceKeyspace != bls.Keyspace {
 				return nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "source keyspaces are mismatched across streams: %v vs %v", ts.sourceKeyspace, bls.Keyspace)
+			}
+
+			if bls.Filter == nil || bls.Filter.Rules == nil {
+				return nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "missing filters for %s/%s", bls.Keyspace, bls.Shard)
 			}
 
 			if ts.tables == nil {
@@ -2780,13 +2926,7 @@ func (s *Server) dropSources(ctx context.Context, ts *trafficSwitcher, removalTy
 		sw = &switcher{ts: ts, s: s}
 	}
 
-	// Lock the workflow and its source and target keyspaces.
-	lockName := fmt.Sprintf("%s/%s", ts.TargetKeyspaceName(), ts.WorkflowName())
-	ctx, workflowUnlock, lockErr := s.ts.LockName(ctx, lockName, "DropSources")
-	if lockErr != nil {
-		return defaultErrorHandler(ts.Logger(), fmt.Sprintf("failed to lock the %s workflow", lockName), lockErr)
-	}
-	defer workflowUnlock(&err)
+	// Lock the source and target keyspaces.
 	ctx, sourceUnlock, lockErr := sw.lockKeyspace(ctx, ts.SourceKeyspaceName(), "DropSources")
 	if lockErr != nil {
 		return defaultErrorHandler(ts.Logger(), fmt.Sprintf("failed to lock the %s keyspace", ts.SourceKeyspaceName()), lockErr)
@@ -2982,7 +3122,7 @@ func (s *Server) updateShardRecords(ctx context.Context, keyspace string, shards
 }
 
 // refreshPrimaryTablets will just RPC-ping all the primary tablets with RefreshState
-func (s *Server) refreshPrimaryTablets(ctx context.Context, shards []*topo.ShardInfo) error {
+func (s *Server) refreshPrimaryTablets(ctx context.Context, shards []*topo.ShardInfo, force bool) error {
 	wg := sync.WaitGroup{}
 	rec := concurrency.AllErrorRecorder{}
 	for _, si := range shards {
@@ -2996,9 +3136,11 @@ func (s *Server) refreshPrimaryTablets(ctx context.Context, shards []*topo.Shard
 			}
 
 			if err := s.tmc.RefreshState(ctx, ti.Tablet); err != nil {
-				rec.RecordError(err)
-			} else {
-				s.Logger().Infof("%v responded", topoproto.TabletAliasString(si.PrimaryAlias))
+				if !force {
+					rec.RecordError(err)
+					return
+				}
+				s.Logger().Warningf("%v encountered error on tablet refresh: %v", topoproto.TabletAliasString(si.PrimaryAlias), err)
 			}
 		}(si)
 	}
@@ -3019,13 +3161,7 @@ func (s *Server) finalizeMigrateWorkflow(ctx context.Context, ts *trafficSwitche
 		sw = &switcher{s: s, ts: ts}
 	}
 
-	// Lock the workflow and its target keyspace.
-	lockName := fmt.Sprintf("%s/%s", ts.TargetKeyspaceName(), ts.WorkflowName())
-	ctx, workflowUnlock, lockErr := s.ts.LockName(ctx, lockName, "completeMigrateWorkflow")
-	if lockErr != nil {
-		return defaultErrorHandler(ts.Logger(), fmt.Sprintf("failed to lock the %s workflow", lockName), lockErr)
-	}
-	defer workflowUnlock(&err)
+	// Lock the target keyspace.
 	ctx, targetUnlock, lockErr := sw.lockKeyspace(ctx, ts.TargetKeyspaceName(), "completeMigrateWorkflow")
 	if lockErr != nil {
 		return defaultErrorHandler(ts.Logger(), fmt.Sprintf("failed to lock the %s keyspace", ts.TargetKeyspaceName()), lockErr)
@@ -3054,10 +3190,21 @@ func (s *Server) finalizeMigrateWorkflow(ctx context.Context, ts *trafficSwitche
 
 // WorkflowSwitchTraffic switches traffic in the direction passed for specified tablet types.
 func (s *Server) WorkflowSwitchTraffic(ctx context.Context, req *vtctldatapb.WorkflowSwitchTrafficRequest) (*vtctldatapb.WorkflowSwitchTrafficResponse, error) {
+	span, ctx := trace.NewSpan(ctx, "workflow.Server.WorkflowSwitchTraffic")
+	defer span.Finish()
+
+	span.Annotate("keyspace", req.Keyspace)
+	span.Annotate("workflow", req.Workflow)
+	span.Annotate("tablet-types", req.TabletTypes)
+	span.Annotate("direction", req.Direction)
+	span.Annotate("enable-reverse-replication", req.EnableReverseReplication)
+	span.Annotate("shards", req.Shards)
+	span.Annotate("force", req.Force)
+
 	var (
-		dryRunResults                     []string
-		rdDryRunResults, wrDryRunResults  *[]string
-		hasReplica, hasRdonly, hasPrimary bool
+		dryRunResults                              []string
+		rdDryRunResults, wrDryRunResults           *[]string
+		switchReplica, switchRdonly, switchPrimary bool
 	)
 	timeout, set, err := protoutil.DurationFromProto(req.GetTimeout())
 	if err != nil {
@@ -3071,7 +3218,20 @@ func (s *Server) WorkflowSwitchTraffic(ctx context.Context, req *vtctldatapb.Wor
 	// a seconds value so you'd get unexpected behavior if you e.g. set the timeout to
 	// 500ms as Etcd would get a value of 0 or a never-ending TTL.
 	if timeout.Seconds() < 1 {
-		return nil, vterrors.Wrap(err, "Timeout must be at least 1 second")
+		return nil, vterrors.Wrap(err, "timeout must be at least 1 second")
+	}
+	maxReplicationLagAllowed, set, err := protoutil.DurationFromProto(req.MaxReplicationLagAllowed)
+	if err != nil {
+		err = vterrors.Wrapf(err, "unable to parse MaxReplicationLagAllowed into a valid duration")
+		return nil, err
+	}
+	if !set {
+		maxReplicationLagAllowed = DefaultTimeout
+	}
+	direction := TrafficSwitchDirection(req.Direction)
+	switchReplica, switchRdonly, switchPrimary, err = parseTabletTypes(req.TabletTypes)
+	if err != nil {
+		return nil, err
 	}
 	ts, startState, err := s.getWorkflowState(ctx, req.Keyspace, req.Workflow)
 	if err != nil {
@@ -3082,42 +3242,70 @@ func (s *Server) WorkflowSwitchTraffic(ctx context.Context, req *vtctldatapb.Wor
 		return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "invalid action for Migrate workflow: SwitchTraffic")
 	}
 
-	maxReplicationLagAllowed, set, err := protoutil.DurationFromProto(req.MaxReplicationLagAllowed)
-	if err != nil {
-		err = vterrors.Wrapf(err, "unable to parse MaxReplicationLagAllowed into a valid duration")
-		return nil, err
+	if ts.IsMultiTenantMigration() {
+		// Multi-tenant migrations use keyspace routing rules, so we need to update the state
+		// using them.
+		err = updateKeyspaceRoutingState(ctx, ts.TopoServer(), ts.sourceKeyspace, ts.targetKeyspace, startState)
+		if err != nil {
+			return nil, vterrors.Wrap(err, "failed to update multi-tenant workflow state using keyspace routing rules")
+		}
 	}
-	if !set {
-		maxReplicationLagAllowed = DefaultTimeout
-	}
-	direction := TrafficSwitchDirection(req.Direction)
-	if direction == DirectionBackward {
-		ts, startState, err = s.getWorkflowState(ctx, startState.SourceKeyspace, ts.reverseWorkflow)
+
+	// We need this to know when there isn't a (non-FROZEN) reverse workflow to use.
+	onlySwitchingReads := !startState.WritesSwitched && !switchPrimary
+
+	// We need this for idempotency and to avoid unnecessary work and resulting risk.
+	writesAlreadySwitched := (direction == DirectionForward && startState.WritesSwitched) ||
+		(direction == DirectionBackward && !startState.WritesSwitched)
+
+	if direction == DirectionBackward && !onlySwitchingReads {
+		if ts.IsMultiTenantMigration() {
+			// In a multi-tenant migration, multiple migrations would be writing to the same
+			// table, so we can't stop writes like we do with MoveTables, using denied tables,
+			// since it would block all other migrations as well as traffic for tenants which
+			// have already been migrated.
+			return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "cannot reverse write traffic for multi-tenant migrations")
+		}
+		// This means that the main workflow is FROZEN and the reverse workflow
+		// exists. So we update the starting state so that we're using the reverse
+		// workflow and we can move forward with a normal traffic switch forward
+		// operation, from the reverse workflow's perspective.
+		ts, startState, err = s.getWorkflowState(ctx, ts.sourceKeyspace, ts.reverseWorkflow)
 		if err != nil {
 			return nil, err
 		}
-		if ts.IsMultiTenantMigration() {
-			// In a multi-tenant migration, multiple migrations would be writing to the same table, so we can't stop writes like
-			// we do with MoveTables, using denied tables, since it would block all other migrations as well as traffic for
-			// tenants which have already been migrated.
-			return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "cannot reverse traffic for multi-tenant migrations")
+		direction = DirectionForward
+	}
+
+	// Lock the workflow for the traffic switching work.
+	lockName := fmt.Sprintf("%s/%s", ts.TargetKeyspaceName(), ts.WorkflowName())
+	ctx, workflowUnlock, lockErr := s.ts.LockName(ctx, lockName, "WorkflowSwitchTraffic")
+	if lockErr != nil {
+		ts.Logger().Errorf("Locking the workflow %s failed: %v", lockName, lockErr)
+		return nil, vterrors.Wrapf(lockErr, "failed to lock the %s workflow", lockName)
+	}
+	defer workflowUnlock(&err)
+
+	ts.force = req.GetForce()
+
+	if writesAlreadySwitched {
+		s.Logger().Infof("Writes already switched no need to check lag for the %s.%s workflow",
+			ts.targetKeyspace, ts.workflow)
+	} else {
+		reason, err := s.canSwitch(ctx, ts, int64(maxReplicationLagAllowed.Seconds()), req.GetShards())
+		if err != nil {
+			return nil, err
+		}
+		if reason != "" {
+			return nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "cannot switch traffic for workflow %s at this time: %s",
+				startState.Workflow, reason)
 		}
 	}
-	reason, err := s.canSwitch(ctx, ts, startState, direction, int64(maxReplicationLagAllowed.Seconds()), req.Shards)
-	if err != nil {
-		return nil, err
-	}
-	if reason != "" {
-		return nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "cannot switch traffic for workflow %s at this time: %s", startState.Workflow, reason)
-	}
-	hasReplica, hasRdonly, hasPrimary, err = parseTabletTypes(req.TabletTypes)
-	if err != nil {
-		return nil, err
-	}
-	if hasReplica || hasRdonly {
+
+	if switchReplica || switchRdonly {
 		// If we're going to switch writes immediately after then we don't need to
 		// rebuild the SrvVSchema here as we will do it after switching writes.
-		if rdDryRunResults, err = s.switchReads(ctx, req, ts, startState, !hasPrimary /* rebuildSrvVSchema */, direction); err != nil {
+		if rdDryRunResults, err = s.switchReads(ctx, req, ts, startState, !switchPrimary /* rebuildSrvVSchema */, direction); err != nil {
 			return nil, err
 		}
 		s.Logger().Infof("Switch Reads done for workflow %s.%s", req.Keyspace, req.Workflow)
@@ -3125,7 +3313,8 @@ func (s *Server) WorkflowSwitchTraffic(ctx context.Context, req *vtctldatapb.Wor
 	if rdDryRunResults != nil {
 		dryRunResults = append(dryRunResults, *rdDryRunResults...)
 	}
-	if hasPrimary {
+
+	if switchPrimary {
 		if _, wrDryRunResults, err = s.switchWrites(ctx, req, ts, timeout, false); err != nil {
 			return nil, err
 		}
@@ -3138,29 +3327,35 @@ func (s *Server) WorkflowSwitchTraffic(ctx context.Context, req *vtctldatapb.Wor
 	if req.DryRun && len(dryRunResults) == 0 {
 		dryRunResults = append(dryRunResults, "No changes required")
 	}
+
 	cmd := "SwitchTraffic"
-	if direction == DirectionBackward {
+	// We must check the original direction requested.
+	if TrafficSwitchDirection(req.Direction) == DirectionBackward {
 		cmd = "ReverseTraffic"
 	}
 	s.Logger().Infof("%s done for workflow %s.%s", cmd, req.Keyspace, req.Workflow)
 	resp := &vtctldatapb.WorkflowSwitchTrafficResponse{}
 	if req.DryRun {
-		resp.Summary = fmt.Sprintf("%s dry run results for workflow %s.%s at %v", cmd, req.Keyspace, req.Workflow, time.Now().UTC().Format(time.RFC822))
+		resp.Summary = fmt.Sprintf("%s dry run results for workflow %s.%s at %v",
+			cmd, req.Keyspace, req.Workflow, time.Now().UTC().Format(time.RFC822))
 		resp.DryRunResults = dryRunResults
 	} else {
 		s.Logger().Infof("%s done for workflow %s.%s", cmd, req.Keyspace, req.Workflow)
 		resp.Summary = fmt.Sprintf("%s was successful for workflow %s.%s", cmd, req.Keyspace, req.Workflow)
-		// Reload the state after the SwitchTraffic operation
-		// and return that as a string.
-		keyspace := req.Keyspace
-		workflow := req.Workflow
-		if direction == DirectionBackward {
-			keyspace = startState.SourceKeyspace
-			workflow = ts.reverseWorkflow
-		}
+		// Reload the state after the SwitchTraffic operation and return that
+		// as a string.
 		resp.StartState = startState.String()
 		s.Logger().Infof("Before reloading workflow state after switching traffic: %+v\n", resp.StartState)
-		_, currentState, err := s.getWorkflowState(ctx, keyspace, workflow)
+		_, currentState, err := s.getWorkflowState(ctx, ts.targetKeyspace, ts.workflow)
+		if ts.IsMultiTenantMigration() {
+			// Multi-tenant migrations use keyspace routing rules, so we need to update the state
+			// using them.
+			sourceKs, targetKs := ts.sourceKeyspace, ts.targetKeyspace
+			if TrafficSwitchDirection(req.Direction) == DirectionBackward {
+				sourceKs, targetKs = targetKs, sourceKs
+			}
+			err = updateKeyspaceRoutingState(ctx, ts.TopoServer(), sourceKs, targetKs, currentState)
+		}
 		if err != nil {
 			resp.CurrentState = fmt.Sprintf("Error reloading workflow state after switching traffic: %v", err)
 		} else {
@@ -3168,6 +3363,7 @@ func (s *Server) WorkflowSwitchTraffic(ctx context.Context, req *vtctldatapb.Wor
 		}
 		s.Logger().Infof("%s done for workflow %s.%s, returning response %v", cmd, req.Keyspace, req.Workflow, resp)
 	}
+
 	return resp, nil
 }
 
@@ -3195,10 +3391,12 @@ func (s *Server) switchReads(ctx context.Context, req *vtctldatapb.WorkflowSwitc
 
 	cellsStr := strings.Join(req.Cells, ",")
 
-	s.Logger().Infof("Switching reads: %s.%s tablet types: %s, cells: %s, workflow state: %s", ts.targetKeyspace, ts.workflow, roTypesToSwitchStr, cellsStr, state.String())
+	s.Logger().Infof("Switching reads: %s.%s tablet types: %s, cells: %s, workflow state: %s",
+		ts.targetKeyspace, ts.workflow, roTypesToSwitchStr, cellsStr, state.String())
 	if !switchReplica && !switchRdonly {
 		return defaultErrorHandler(ts.Logger(), "invalid tablet types",
-			vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "tablet types must be REPLICA or RDONLY: %s", roTypesToSwitchStr))
+			vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "tablet types must be REPLICA or RDONLY: %s",
+				roTypesToSwitchStr))
 	}
 	// For partial (shard-by-shard migrations) or multi-tenant migrations, traffic for all tablet types
 	// is expected to be switched at once. For other MoveTables migrations where we use table routing rules
@@ -3209,18 +3407,20 @@ func (s *Server) switchReads(ctx context.Context, req *vtctldatapb.WorkflowSwitc
 		// shard level traffic switching is all or nothing
 		trafficSwitchingIsAllOrNothing = true
 	case ts.MigrationType() == binlogdatapb.MigrationType_TABLES && ts.IsMultiTenantMigration():
-		if direction == DirectionBackward {
-			return defaultErrorHandler(ts.Logger(), "invalid request", vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT,
-				"requesting reversal of read traffic for multi-tenant migrations is not supported"))
-		}
-		// For multi-tenant migrations, we only support switching traffic to all cells at once
+		// For multi-tenant migrations, we only support switching traffic to all cells at once.
 		allCells, err := ts.TopoServer().GetCellInfoNames(ctx)
 		if err != nil {
 			return nil, err
 		}
-		if len(req.GetCells()) != 0 && len(req.GetCells()) != len(allCells) {
-			return defaultErrorHandler(ts.Logger(), "invalid request", vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT,
-				"requesting read traffic for multi-tenant migrations must include all cells"))
+
+		if len(req.GetCells()) > 0 {
+			slices.Sort(req.GetCells())
+			slices.Sort(allCells)
+			if !slices.Equal(req.GetCells(), allCells) {
+				return defaultErrorHandler(ts.Logger(), "invalid request", vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT,
+					"requesting switch of read traffic for multi-tenant migrations must include all cells; all cells: %v, requested cells: %v",
+					strings.Join(allCells, ","), strings.Join(req.GetCells(), ",")))
+			}
 		}
 	}
 
@@ -3231,7 +3431,7 @@ func (s *Server) switchReads(ctx context.Context, req *vtctldatapb.WorkflowSwitc
 		}
 		if direction == DirectionBackward && switchRdonly && len(state.RdonlyCellsSwitched) == 0 {
 			return defaultErrorHandler(ts.Logger(), "invalid request", vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION,
-				"requesting reversal of SwitchReads for RDONLYs but RDONLY reads have not been switched"))
+				"requesting reversal of read traffic for RDONLYs but RDONLY reads have not been switched"))
 		}
 	}
 
@@ -3250,14 +3450,14 @@ func (s *Server) switchReads(ctx context.Context, req *vtctldatapb.WorkflowSwitc
 		}
 	}
 
-	// If journals exist notify user and fail.
 	journalsExist, _, err := ts.checkJournals(ctx)
-	if err != nil {
+	if err != nil && !req.GetForce() {
 		return defaultErrorHandler(ts.Logger(), fmt.Sprintf("failed to read journal in the %s keyspace", ts.SourceKeyspaceName()), err)
 	}
 	if journalsExist {
 		s.Logger().Infof("Found a previous journal entry for %d", ts.id)
 	}
+
 	var sw iswitcher
 	if req.DryRun {
 		sw = &switcherDryRun{ts: ts, drLog: NewLogRecorder()}
@@ -3368,18 +3568,18 @@ func (s *Server) switchWrites(ctx context.Context, req *vtctldatapb.WorkflowSwit
 	}
 
 	if req.EnableReverseReplication {
+		// Does the source keyspace have tablets that are able to manage
+		// the reverse workflow?
+		if err := s.validateShardsHaveVReplicationPermissions(ctx, ts.SourceKeyspaceName(), ts.SourceShards()); err != nil {
+			return handleError(fmt.Sprintf("primary tablets are not able to fully manage the reverse vreplication workflow in the %s keyspace",
+				ts.SourceKeyspaceName()), err)
+		}
+		// Does the target keyspace have tablets available to stream from
+		// for the reverse workflow?
 		if err := areTabletsAvailableToStreamFrom(ctx, req, ts, ts.TargetKeyspaceName(), ts.TargetShards()); err != nil {
-			return handleError(fmt.Sprintf("no tablets were available to stream from in the %s keyspace", ts.SourceKeyspaceName()), err)
+			return handleError(fmt.Sprintf("no tablets were available to stream from in the %s keyspace", ts.TargetKeyspaceName()), err)
 		}
 	}
-
-	// Lock the workflow and its source and target keyspaces.
-	lockName := fmt.Sprintf("%s/%s", ts.TargetKeyspaceName(), ts.WorkflowName())
-	ctx, workflowUnlock, lockErr := s.ts.LockName(ctx, lockName, "SwitchWrites")
-	if lockErr != nil {
-		return handleError(fmt.Sprintf("failed to lock the %s workflow", lockName), lockErr)
-	}
-	defer workflowUnlock(&err)
 
 	// We need to hold the keyspace locks longer than waitTimeout*X -- where X
 	// is the number of sub-steps where the waitTimeout value is used: stopping
@@ -3597,14 +3797,8 @@ func (s *Server) switchWrites(ctx context.Context, req *vtctldatapb.WorkflowSwit
 	return ts.id, sw.logs(), nil
 }
 
-func (s *Server) canSwitch(ctx context.Context, ts *trafficSwitcher, state *State, direction TrafficSwitchDirection,
-	maxAllowedReplLagSecs int64, shards []string) (reason string, err error) {
-	if direction == DirectionForward && state.WritesSwitched ||
-		direction == DirectionBackward && !state.WritesSwitched {
-		s.Logger().Infof("writes already switched no need to check lag")
-		return "", nil
-	}
-	wf, err := s.GetWorkflow(ctx, state.TargetKeyspace, state.Workflow, false, shards)
+func (s *Server) canSwitch(ctx context.Context, ts *trafficSwitcher, maxAllowedReplLagSecs int64, shards []string) (reason string, err error) {
+	wf, err := s.GetWorkflow(ctx, ts.targetKeyspace, ts.workflow, false, shards)
 	if err != nil {
 		return "", err
 	}
@@ -3637,10 +3831,15 @@ func (s *Server) canSwitch(ctx context.Context, ts *trafficSwitcher, state *Stat
 		defer wg.Done()
 		for _, si := range shards {
 			if partial, partialDetails, err := topotools.RefreshTabletsByShard(rtbsCtx, s.ts, s.tmc, si, nil, ts.Logger()); err != nil || partial {
-				m.Lock()
-				refreshErrors.WriteString(fmt.Sprintf("failed to successfully refresh all tablets in the %s/%s %s shard (%v):\n  %v\n",
-					si.Keyspace(), si.ShardName(), stype, err, partialDetails))
-				m.Unlock()
+				msg := fmt.Sprintf("failed to successfully refresh all tablets in the %s/%s %s shard (%v):\n  %v\n",
+					si.Keyspace(), si.ShardName(), stype, err, partialDetails)
+				if partial && ts.force {
+					log.Warning(msg)
+				} else {
+					m.Lock()
+					refreshErrors.WriteString(msg)
+					m.Unlock()
+				}
 			}
 		}
 	}
@@ -3778,7 +3977,8 @@ func fillStringTemplate(tmpl string, vars any) (string, error) {
 
 // prepareCreateLookup performs the preparatory steps for creating a
 // Lookup Vindex.
-func (s *Server) prepareCreateLookup(ctx context.Context, workflow, keyspace string, specs *vschemapb.Keyspace, continueAfterCopyWithOwner bool) (ms *vtctldatapb.MaterializeSettings, sourceVSchema, targetVSchema *vschemapb.Keyspace, err error) {
+func (s *Server) prepareCreateLookup(ctx context.Context, workflow, keyspace string, specs *vschemapb.Keyspace, continueAfterCopyWithOwner bool) (
+	ms *vtctldatapb.MaterializeSettings, sourceVSchema, targetVSchema *vschemapb.Keyspace, cancelFunc func() error, err error) {
 	// Important variables are pulled out here.
 	var (
 		vindexName        string
@@ -3804,19 +4004,19 @@ func (s *Server) prepareCreateLookup(ctx context.Context, workflow, keyspace str
 
 	// Validate input vindex.
 	if specs == nil {
-		return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "no vindex provided")
+		return nil, nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "no vindex provided")
 	}
 	if len(specs.Vindexes) != 1 {
-		return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "only one vindex must be specified")
+		return nil, nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "only one vindex must be specified")
 	}
 	vindexName = maps.Keys(specs.Vindexes)[0]
 	vindex = maps.Values(specs.Vindexes)[0]
 	if !strings.Contains(vindex.Type, "lookup") {
-		return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "vindex %s is not a lookup type", vindex.Type)
+		return nil, nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "vindex %s is not a lookup type", vindex.Type)
 	}
 	targetKeyspace, targetTableName, err = s.env.Parser().ParseTable(vindex.Params["table"])
 	if err != nil || targetKeyspace == "" {
-		return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "vindex table name (%s) must be in the form <keyspace>.<table>", vindex.Params["table"])
+		return nil, nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "vindex table name (%s) must be in the form <keyspace>.<table>", vindex.Params["table"])
 	}
 	vindexFromCols = strings.Split(vindex.Params["from"], ",")
 	for i, col := range vindexFromCols {
@@ -3824,11 +4024,11 @@ func (s *Server) prepareCreateLookup(ctx context.Context, workflow, keyspace str
 	}
 	if strings.Contains(vindex.Type, "unique") {
 		if len(vindexFromCols) != 1 {
-			return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unique vindex 'from' should have only one column")
+			return nil, nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unique vindex 'from' should have only one column")
 		}
 	} else {
 		if len(vindexFromCols) < 2 {
-			return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "non-unique vindex 'from' should have more than one column")
+			return nil, nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "non-unique vindex 'from' should have more than one column")
 		}
 	}
 	vindexToCol = vindex.Params["to"]
@@ -3837,7 +4037,7 @@ func (s *Server) prepareCreateLookup(ctx context.Context, workflow, keyspace str
 	vindex.Params["write_only"] = "true"
 	// See if we can create the vindex without errors.
 	if _, err := vindexes.CreateVindex(vindex.Type, vindexName, vindex.Params); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	if ignoreNullsStr, ok := vindex.Params["ignore_nulls"]; ok {
 		// This mirrors the behavior of vindexes.boolFromMap().
@@ -3847,19 +4047,22 @@ func (s *Server) prepareCreateLookup(ctx context.Context, workflow, keyspace str
 		case "false":
 			vindexIgnoreNulls = false
 		default:
-			return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "ignore_nulls (%s) value must be 'true' or 'false'",
-				ignoreNullsStr)
+			return nil, nil, nil, nil,
+				vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "ignore_nulls (%s) value must be 'true' or 'false'",
+					ignoreNullsStr)
 		}
 	}
 
 	// Validate input table.
 	if len(specs.Tables) < 1 || len(specs.Tables) > 2 {
-		return nil, nil, nil, fmt.Errorf("one or two tables must be specified")
+		return nil, nil, nil, nil, fmt.Errorf("one or two tables must be specified")
 	}
 	// Loop executes once or twice.
 	for tableName, table := range specs.Tables {
 		if len(table.ColumnVindexes) != 1 {
-			return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "exactly one ColumnVindex must be specified for the %s table", tableName)
+			return nil, nil, nil, nil,
+				vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "exactly one ColumnVindex must be specified for the %s table",
+					tableName)
 		}
 		if tableName != targetTableName { // This is the source table.
 			sourceTableName = tableName
@@ -3873,42 +4076,55 @@ func (s *Server) prepareCreateLookup(ctx context.Context, workflow, keyspace str
 			vindexCols = table.ColumnVindexes[0].Columns
 		} else {
 			if table.ColumnVindexes[0].Column == "" {
-				return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "at least one column must be specified in ColumnVindexes for the %s table", tableName)
+				return nil, nil, nil, nil,
+					vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "at least one column must be specified in ColumnVindexes for the %s table",
+						tableName)
 			}
 			vindexCols = []string{table.ColumnVindexes[0].Column}
 		}
 		if !slices.Equal(vindexCols, vindexFromCols) {
-			return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "columns in the lookup table %s primary vindex (%s) don't match the 'from' columns specified (%s)",
-				tableName, strings.Join(vindexCols, ","), strings.Join(vindexFromCols, ","))
+			return nil, nil, nil, nil,
+				vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "columns in the lookup table %s primary vindex (%s) don't match the 'from' columns specified (%s)",
+					tableName, strings.Join(vindexCols, ","), strings.Join(vindexFromCols, ","))
 		}
 	}
 
 	// Validate input table and vindex consistency.
 	if sourceTable == nil || len(sourceTable.ColumnVindexes) != 1 {
-		return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "No ColumnVindex found for the owner table in the %s keyspace", keyspace)
+		return nil, nil, nil, nil,
+			vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "No ColumnVindex found for the owner table (%s) in the %s keyspace",
+				sourceTable, keyspace)
 	}
 	if sourceTable.ColumnVindexes[0].Name != vindexName {
-		return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "ColumnVindex name (%s) must match vindex name (%s)", sourceTable.ColumnVindexes[0].Name, vindexName)
+		return nil, nil, nil, nil,
+			vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "ColumnVindex name (%s) must match vindex name (%s)",
+				sourceTable.ColumnVindexes[0].Name, vindexName)
 	}
 	if vindex.Owner != "" && vindex.Owner != sourceTableName {
-		return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "vindex owner (%s) must match table name (%s)", vindex.Owner, sourceTableName)
+		return nil, nil, nil, nil,
+			vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "vindex owner (%s) must match table name (%s)",
+				vindex.Owner, sourceTableName)
 	}
 	if len(sourceTable.ColumnVindexes[0].Columns) != 0 {
 		sourceVindexColumns = sourceTable.ColumnVindexes[0].Columns
 	} else {
 		if sourceTable.ColumnVindexes[0].Column == "" {
-			return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "at least one column must be specified in ColumnVindexes for the %s table", sourceTableName)
+			return nil, nil, nil, nil,
+				vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "at least one column must be specified in ColumnVindexes for the %s table",
+					sourceTableName)
 		}
 		sourceVindexColumns = []string{sourceTable.ColumnVindexes[0].Column}
 	}
 	if len(sourceVindexColumns) != len(vindexFromCols) {
-		return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "length of table columns (%d) differs from length of vindex columns (%d)", len(sourceVindexColumns), len(vindexFromCols))
+		return nil, nil, nil, nil,
+			vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "length of table columns (%d) differs from length of vindex columns (%d)",
+				len(sourceVindexColumns), len(vindexFromCols))
 	}
 
 	// Validate against source vschema.
 	sourceVSchema, err = s.ts.GetVSchema(ctx, keyspace)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	if sourceVSchema.Vindexes == nil {
 		sourceVSchema.Vindexes = make(map[string]*vschemapb.Vindex)
@@ -3920,7 +4136,7 @@ func (s *Server) prepareCreateLookup(ctx context.Context, workflow, keyspace str
 	} else {
 		targetVSchema, err = s.ts.GetVSchema(ctx, targetKeyspace)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 	}
 	if targetVSchema.Vindexes == nil {
@@ -3931,12 +4147,15 @@ func (s *Server) prepareCreateLookup(ctx context.Context, workflow, keyspace str
 	}
 	if existing, ok := sourceVSchema.Vindexes[vindexName]; ok {
 		if !proto.Equal(existing, vindex) { // If the exact same vindex already exists then we can re-use it
-			return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "a conflicting vindex named %s already exists in the %s keyspace", vindexName, keyspace)
+			return nil, nil, nil, nil,
+				vterrors.Errorf(vtrpcpb.Code_INTERNAL, "a conflicting vindex named %s already exists in the %s keyspace",
+					vindexName, keyspace)
 		}
 	}
 	sourceVSchemaTable = sourceVSchema.Tables[sourceTableName]
 	if sourceVSchemaTable == nil && !schema.IsInternalOperationTableName(sourceTableName) {
-		return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "table %s not found in the %s keyspace", sourceTableName, keyspace)
+		return nil, nil, nil, nil,
+			vterrors.Errorf(vtrpcpb.Code_INTERNAL, "table %s not found in the %s keyspace", sourceTableName, keyspace)
 	}
 	for _, colVindex := range sourceVSchemaTable.ColumnVindexes {
 		// For a conflict, the vindex name and column should match.
@@ -3953,41 +4172,47 @@ func (s *Server) prepareCreateLookup(ctx context.Context, workflow, keyspace str
 		// are not the same then they are two distinct conflicting vindexes and we should
 		// not proceed.
 		if !slices.Equal(colNames, sourceVindexColumns) {
-			return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "a conflicting ColumnVindex on column(s) %s in table %s already exists in the %s keyspace",
-				strings.Join(colNames, ","), sourceTableName, keyspace)
+			return nil, nil, nil, nil,
+				vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "a conflicting ColumnVindex on column(s) %s in table %s already exists in the %s keyspace",
+					strings.Join(colNames, ","), sourceTableName, keyspace)
 		}
 	}
 
 	// Validate against source schema.
 	sourceShards, err := s.ts.GetServingShards(ctx, keyspace)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	onesource := sourceShards[0]
 	if onesource.PrimaryAlias == nil {
-		return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "source shard %s has no primary", onesource.ShardName())
+		return nil, nil, nil, nil,
+			vterrors.Errorf(vtrpcpb.Code_INTERNAL, "source shard %s has no primary", onesource.ShardName())
 	}
 	req := &tabletmanagerdatapb.GetSchemaRequest{Tables: []string{sourceTableName}}
 	tableSchema, err := schematools.GetSchema(ctx, s.ts, s.tmc, onesource.PrimaryAlias, req)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	if len(tableSchema.TableDefinitions) != 1 {
-		return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "unexpected number of tables (%d) returned from %s schema", len(tableSchema.TableDefinitions), keyspace)
+		return nil, nil, nil, nil,
+			vterrors.Errorf(vtrpcpb.Code_INTERNAL, "unexpected number of tables (%d) returned from %s schema",
+				len(tableSchema.TableDefinitions), keyspace)
 	}
 
 	// Generate "create table" statement.
 	lines := strings.Split(tableSchema.TableDefinitions[0].Schema, "\n")
 	if len(lines) < 3 {
 		// Should never happen.
-		return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "schema looks incorrect: %s, expecting at least four lines", tableSchema.TableDefinitions[0].Schema)
+		return nil, nil, nil, nil,
+			vterrors.Errorf(vtrpcpb.Code_INTERNAL, "schema looks incorrect: %s, expecting at least four lines",
+				tableSchema.TableDefinitions[0].Schema)
 	}
 	var modified []string
 	modified = append(modified, strings.Replace(lines[0], sourceTableName, targetTableName, 1))
 	for i := range sourceVindexColumns {
 		line, err := generateColDef(lines, sourceVindexColumns[i], vindexFromCols[i])
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		modified = append(modified, line)
 	}
@@ -4010,7 +4235,8 @@ func (s *Server) prepareCreateLookup(ctx context.Context, workflow, keyspace str
 	createDDL = strings.Join(modified, "\n")
 	// Confirm that our DDL is valid before we create anything.
 	if _, err = s.env.Parser().ParseStrictDDL(createDDL); err != nil {
-		return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "error: %v; invalid lookup table definition generated: %s", err, createDDL)
+		return nil, nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "error: %v; invalid lookup table definition generated: %s",
+			err, createDDL)
 	}
 
 	// Generate vreplication query.
@@ -4045,6 +4271,11 @@ func (s *Server) prepareCreateLookup(ctx context.Context, workflow, keyspace str
 	}
 	materializeQuery = buf.String()
 
+	// Save a copy of the original vschema if we modify it and need to provide
+	// a cancelFunc.
+	ogTargetVSchema := targetVSchema.CloneVT()
+	targetChanged := false
+
 	// Update targetVSchema.
 	targetTable := specs.Tables[targetTableName]
 	if targetVSchema.Sharded {
@@ -4060,7 +4291,7 @@ func (s *Server) prepareCreateLookup(ctx context.Context, workflow, keyspace str
 				if targetVindexType == "" {
 					targetVindexType, err = vindexes.ChooseVindexForType(field.Type)
 					if err != nil {
-						return nil, nil, nil, err
+						return nil, nil, nil, nil, err
 					}
 				}
 				targetVindex = &vschemapb.Vindex{
@@ -4071,14 +4302,19 @@ func (s *Server) prepareCreateLookup(ctx context.Context, workflow, keyspace str
 		}
 		if targetVindex == nil {
 			// Unreachable. We validated column names when generating the DDL.
-			return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "column %s not found in target schema %s", sourceVindexColumns[0], tableSchema.TableDefinitions[0].Schema)
+			return nil, nil, nil, nil,
+				vterrors.Errorf(vtrpcpb.Code_INTERNAL, "column %s not found in target schema %s",
+					sourceVindexColumns[0], tableSchema.TableDefinitions[0].Schema)
 		}
 		if existing, ok := targetVSchema.Vindexes[targetVindexType]; ok {
 			if !proto.Equal(existing, targetVindex) {
-				return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "a conflicting vindex named %v already exists in the %s keyspace", targetVindexType, targetKeyspace)
+				return nil, nil, nil, nil,
+					vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "a conflicting vindex named %v already exists in the %s keyspace",
+						targetVindexType, targetKeyspace)
 			}
 		} else {
 			targetVSchema.Vindexes[targetVindexType] = targetVindex
+			targetChanged = true
 		}
 
 		targetTable = &vschemapb.Table{
@@ -4092,10 +4328,20 @@ func (s *Server) prepareCreateLookup(ctx context.Context, workflow, keyspace str
 	}
 	if existing, ok := targetVSchema.Tables[targetTableName]; ok {
 		if !proto.Equal(existing, targetTable) {
-			return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "a conflicting table named %s already exists in the %s vschema", targetTableName, targetKeyspace)
+			return nil, nil, nil, nil,
+				vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "a conflicting table named %s already exists in the %s vschema",
+					targetTableName, targetKeyspace)
 		}
 	} else {
 		targetVSchema.Tables[targetTableName] = targetTable
+		targetChanged = true
+	}
+
+	if targetChanged {
+		cancelFunc = func() error {
+			// Restore the original target vschema.
+			return s.ts.SaveVSchema(ctx, targetKeyspace, ogTargetVSchema)
+		}
 	}
 
 	ms = &vtctldatapb.MaterializeSettings{
@@ -4115,7 +4361,7 @@ func (s *Server) prepareCreateLookup(ctx context.Context, workflow, keyspace str
 	sourceVSchema.Vindexes[vindexName] = vindex
 	sourceVSchemaTable.ColumnVindexes = append(sourceVSchemaTable.ColumnVindexes, sourceTable.ColumnVindexes[0])
 
-	return ms, sourceVSchema, targetVSchema, nil
+	return ms, sourceVSchema, targetVSchema, cancelFunc, nil
 }
 
 func generateColDef(lines []string, sourceVindexCol, vindexFromCol string) (string, error) {
@@ -4229,7 +4475,9 @@ func (s *Server) WorkflowMirrorTraffic(ctx context.Context, req *vtctldatapb.Wor
 		}
 	}
 	if len(cannotSwitchTabletTypes) > 0 {
-		return nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "cannot mirror [%s] traffic for workflow %s at this time: traffic for those tablet types is switched", strings.Join(cannotSwitchTabletTypes, ","), startState.Workflow)
+		return nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION,
+			"cannot mirror [%s] traffic for workflow %s at this time: traffic for those tablet types is switched",
+			strings.Join(cannotSwitchTabletTypes, ","), startState.Workflow)
 	}
 
 	if err := s.mirrorTraffic(ctx, req, ts, startState); err != nil {
@@ -4275,6 +4523,50 @@ func (s *Server) mirrorTraffic(ctx context.Context, req *vtctldatapb.WorkflowMir
 		return handleError("failed to mirror traffic for the tables", err)
 	}
 
+	return nil
+}
+
+// validateShardsHaveVReplicationPermissions checks that the primary tablets
+// in the given keyspace shards have the required permissions necessary to
+// perform actions on the workflow.
+func (s *Server) validateShardsHaveVReplicationPermissions(ctx context.Context, keyspace string, shards []*topo.ShardInfo) error {
+	validateEg, validateCtx := errgroup.WithContext(ctx)
+	for _, shard := range shards {
+		primary := shard.PrimaryAlias
+		if primary == nil {
+			return vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "%s/%s shard does not have a primary tablet",
+				keyspace, shard.ShardName())
+		}
+		validateEg.Go(func() error {
+			tablet, err := s.ts.GetTablet(validateCtx, primary)
+			if err != nil {
+				return vterrors.Wrapf(err, "failed to get primary tablet for the %s/%s shard", keyspace, shard.ShardName())
+			}
+			// Ensure the tablet has the minimum privileges required on the sidecar database
+			// table(s) in order to manage the workflow.
+			req := &tabletmanagerdatapb.ValidateVReplicationPermissionsRequest{}
+			res, err := s.tmc.ValidateVReplicationPermissions(validateCtx, tablet.Tablet, req)
+			if err != nil {
+				// This older tablet handling can be removed in v22 or later.
+				if st, ok := status.FromError(err); ok && st.Code() == codes.Unimplemented {
+					// This is a pre v21 tablet, so don't return an error since the
+					// permissions not being there should be very rare.
+					return nil
+				}
+				return vterrors.Wrapf(err, "failed to validate required vreplication metadata permissions on tablet %s",
+					topoproto.TabletAliasString(tablet.Alias))
+			}
+			if !res.GetOk() {
+				return vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION,
+					"user %s does not have the required set of permissions (select,insert,update,delete) on the %s.vreplication table on tablet %s",
+					res.GetUser(), sidecar.GetIdentifier(), topoproto.TabletAliasString(tablet.Alias))
+			}
+			return nil
+		})
+	}
+	if err := validateEg.Wait(); err != nil {
+		return err
+	}
 	return nil
 }
 
